@@ -564,22 +564,31 @@ cvt_fp16_to_fp4_expert(
     // Find index within the experts
     int rowIdx_in_expert = rowIdx - expert_idx * m;
 
-    // Early exit when using masks.
-    if (use_mask && rowIdx_in_expert >= mask[expert_idx]) {
+    // Check if this thread is processing a masked (padding) row.
+    // We cannot simply `break` here because cvt_warp_fp16_to_fp4 uses
+    // __shfl_xor_sync(uint32_t(-1), ...) for warp-level scale factor reduction.
+    // If some threads break while their shuffle partners continue, the partners
+    // read undefined register values (potentially NaN), corrupting scale factors.
+    // Instead, masked threads participate with zeroed data and skip output writes.
+    bool is_masked = use_mask && rowIdx_in_expert >= mask[expert_idx];
+
+    // Fast exit: if ALL threads in the warp are masked, no shuffle partner needs us.
+    if (__all_sync(uint32_t(-1), is_masked)) {
       break;
     }
 
-    int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
-    PackedVecT in_vec = reinterpret_cast<PackedVecT const*>(in)[inOffset];
-    if (use_silu_and_mul) {
-      PackedVecT in_vec_mul = reinterpret_cast<PackedVecT const*>(in)[inOffset + colsPerRow];
-      silu_and_mul<Type, CVT_FP4_ELTS_PER_THREAD>(in_vec, in_vec_mul);
+    PackedVecT in_vec;
+    if (is_masked) {
+      // Zero input to prevent NaN/garbage from corrupting warp-level max reduction.
+      memset(&in_vec, 0, sizeof(in_vec));
+    } else {
+      int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
+      in_vec = reinterpret_cast<PackedVecT const*>(in)[inOffset];
+      if (use_silu_and_mul) {
+        PackedVecT in_vec_mul = reinterpret_cast<PackedVecT const*>(in)[inOffset + colsPerRow];
+        silu_and_mul<Type, CVT_FP4_ELTS_PER_THREAD>(in_vec, in_vec_mul);
+      }
     }
-
-    // Get the output tensor offset.
-    // Same as inOffset because 8 elements are packed into one uint32_t.
-    int64_t outOffset = rowIdx * colsPerRow + colIdx;
-    auto& out_pos = out[outOffset];
 
     // Get the global scaling factor, which will be applied to the SF.
     // Note SFScale is the same as next GEMM's alpha, which is
@@ -592,12 +601,21 @@ cvt_fp16_to_fp4_expert(
     int numCols_SFout = numCols_padded / CVT_FP4_SF_VEC_SIZE / 4;
     uint32_t* SFout_in_expert = SFout + expert_idx * padded_m * numCols_SFout;
 
-    auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE,
-                                                     CVT_FP4_NUM_THREADS_PER_SF>(
-        rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
+    // For masked rows, pass nullptr to suppress the SF write.
+    auto sf_out = is_masked
+        ? static_cast<uint8_t*>(nullptr)
+        : cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE,
+                                              CVT_FP4_NUM_THREADS_PER_SF>(
+              rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
 
-    out_pos = cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP4_ELTS_PER_THREAD, UE8M0_SF>(
+    auto result = cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP4_ELTS_PER_THREAD, UE8M0_SF>(
         in_vec, SFScaleVal, sf_out);
+
+    // Only write output for non-masked rows.
+    if (!is_masked) {
+      int64_t outOffset = rowIdx * colsPerRow + colIdx;
+      out[outOffset] = result;
+    }
   }
 #endif
 }
