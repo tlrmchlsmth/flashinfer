@@ -358,7 +358,7 @@ activationDeepSeekKernelV2(KernelParams params) {
 
   float constexpr E4m3MaxVal{448.f};
   int const totalPadded = params.totalNumPaddedTokens[0];
-  int const sfStride = params.maxPermutedPaddedCount;
+  int const sfStride = totalPadded;
 
   int const hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x;
   if (hiddenIdx >= params.innerDim / 2) return;
