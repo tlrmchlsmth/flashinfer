@@ -187,7 +187,11 @@ struct KernelTraits<2> {
 
 template <>
 struct KernelTraits<1> {
+#if CUDA_VERSION >= 12090
   using MaxOp = cuda::maximum<>;
+#else
+  using MaxOp = cub::Max;
+#endif
   using PackedType = float;
 };
 
@@ -332,6 +336,69 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA)
+activationDeepSeekKernelV2(KernelParams params) {
+  using Type = typename KernelParams::Type;
+  using BlockReduce = cub::BlockReduce<float, DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA>;
+
+  __shared__ float s_scaleOut;
+  __shared__ typename BlockReduce::TempStorage tempStorage;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  if constexpr (KernelParams::UsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
+  }
+#endif
+
+  float constexpr E4m3MaxVal{448.f};
+  int const totalPadded = params.totalNumPaddedTokens[0];
+  int const sfStride = params.maxPermutedPaddedCount;
+
+  int const hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x;
+  if (hiddenIdx >= params.innerDim / 2) return;
+
+  for (int permutedRow = blockIdx.y; permutedRow < totalPadded; permutedRow += gridDim.y) {
+    int64_t const baseIdx = (int64_t)permutedRow * params.innerDim + hiddenIdx;
+    int64_t const scale1Idx =
+        (int64_t)permutedRow + (int64_t)sfStride * (hiddenIdx / 128);
+    int64_t const scale2Idx =
+        (int64_t)permutedRow +
+        (int64_t)sfStride * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
+
+    float scale1 = params.inDqSfsPtr[scale1Idx];
+    float scale2 = params.inDqSfsPtr[scale2Idx];
+    float x1 = scale1 * static_cast<float>(params.inPtr[baseIdx]);
+    float x2 = scale2 * static_cast<float>(params.inPtr[baseIdx + params.innerDim / 2]);
+
+    float out = silu(x2) * x1;
+    float absOut = fabsf(out);
+
+#if CUDA_VERSION >= 12090
+    float aMax = BlockReduce(tempStorage).Reduce(absOut, cuda::maximum<>{});
+#else
+    float aMax = BlockReduce(tempStorage).Reduce(absOut, cub::Max{});
+#endif
+
+    if (threadIdx.x == 0) {
+      float scaleOut = fmaxf(aMax / E4m3MaxVal, std::numeric_limits<float>::min());
+      s_scaleOut = scaleOut;
+      int64_t const scaleOutIdx =
+          (int64_t)permutedRow + (int64_t)sfStride * (hiddenIdx / 128);
+      params.outDqSfsPtr[scaleOutIdx] = scaleOut;
+    }
+    __syncthreads();
+
+    int64_t const outIdx = (int64_t)permutedRow * (params.innerDim / 2) + hiddenIdx;
+    params.outPtr[outIdx] = static_cast<Type>(out / s_scaleOut);
+  }
+}
+
 void run(Data const& data, void* stream) {
   if (data.mDtypeElt == tg::Dtype::E2m1) {
     // Note: this should be unreachable because the options are checked beforehand.
@@ -369,8 +436,12 @@ void run(Data const& data, void* stream) {
 
     const dim3 grid(gridSizeX, gridSizeY, data.topK);
 
-    LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid,
-                      DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
+    {
+      int const gridSizeYV2 = std::min(8192, std::max(1, data.maxPermutedPaddedCount));
+      const dim3 gridV2(gridSizeX, gridSizeYV2, 1);
+      LAUNCH_ACTIVATION(data, activationDeepSeekKernelV2, 1, gridV2,
+                        DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
+    }
   } else {
     int const numThreads = 256;
     const dim3 grid(data.innerDim / 128, data.topK, std::min(8192, data.numTokens));
@@ -940,7 +1011,11 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
       float constexpr E4m3MaxVal{448.f};
 
       // Compute the absolute max
+#if CUDA_VERSION >= 12090
       float aMax = BlockReduce(temp_storage).Reduce(fabsf(acc), cuda::maximum<>{});
+#else
+      float aMax = BlockReduce(temp_storage).Reduce(fabsf(acc), cub::Max{});
+#endif
 
       if (threadIdx.x == 0) {
         if (params.outDqSfsPtr) {
