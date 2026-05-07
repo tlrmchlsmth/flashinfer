@@ -52,47 +52,7 @@ namespace tg = batchedGemm::trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline __device__ float silu_exact(float x) { return x / (1.0f + expf(-x)); }
-
-template <int Order, int R>
-struct SigmoidCoeffs;
-
-template <>
-struct SigmoidCoeffs<7, 4> {
-  static constexpr float c1 =  2.462426192661e-01f;
-  static constexpr float c3 = -1.703947593389e-02f;
-  static constexpr float c5 =  8.886987390998e-04f;
-  static constexpr float c7 = -1.974016814640e-05f;
-};
-
-template <>
-struct SigmoidCoeffs<9, 4> {
-  static constexpr float c1 =  2.489274376408e-01f;
-  static constexpr float c3 = -1.927682457946e-02f;
-  static constexpr float c5 =  1.392102184355e-03f;
-  static constexpr float c7 = -6.169045525097e-05f;
-  static constexpr float c9 =  1.165285752905e-06f;
-};
-
-template <int Order = 7, int R = 4>
-inline __device__ float sigmoid_approx(float x) {
-  using C = SigmoidCoeffs<Order, R>;
-  float clamped = fminf(fmaxf(x, -(float)R), (float)R);
-  float t = clamped * clamped;
-  if constexpr (Order >= 9) {
-    return 0.5f + clamped * (C::c1 + t * (C::c3 + t * (C::c5 + t * (C::c7 + t * C::c9))));
-  } else {
-    return 0.5f + clamped * (C::c1 + t * (C::c3 + t * (C::c5 + t * C::c7)));
-  }
-}
-
-inline __device__ float silu(float x) {
-#ifdef FLASHINFER_SILU_APPROX
-  return x * sigmoid_approx(x);
-#else
-  return silu_exact(x);
-#endif
-}
+inline __device__ float silu(float x) { return x / (1.0f + expf(-x)); }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

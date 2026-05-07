@@ -786,56 +786,7 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx, i
   return nullptr;
 }
 
-__device__ __forceinline__ float silu_exact(const float& val) {
-  return val / (1.0f + __expf(-val));
-}
-
-// Chebyshev polynomial approximation of sigmoid on [-R, R], clamped outside.
-// Coefficients are precomputed for R=4 (the sweet spot: sigmoid(4)=0.982).
-// Order 7: 5.4% max silu relative error, 4 FMA — sufficient for FP8 E4M3
-// Order 9: 1.3% max silu relative error, 5 FMA — comfortable margin
-//
-// To support other R values, recompute coefficients with the Chebyshev fitting
-// script and add a specialization below.
-template <int Order, int R>
-struct SigmoidCoeffs;
-
-template <>
-struct SigmoidCoeffs<7, 4> {
-  static constexpr float c1 =  2.462426192661e-01f;
-  static constexpr float c3 = -1.703947593389e-02f;
-  static constexpr float c5 =  8.886987390998e-04f;
-  static constexpr float c7 = -1.974016814640e-05f;
-};
-
-template <>
-struct SigmoidCoeffs<9, 4> {
-  static constexpr float c1 =  2.489274376408e-01f;
-  static constexpr float c3 = -1.927682457946e-02f;
-  static constexpr float c5 =  1.392102184355e-03f;
-  static constexpr float c7 = -6.169045525097e-05f;
-  static constexpr float c9 =  1.165285752905e-06f;
-};
-
-template <int Order = 7, int R = 4>
-__device__ __forceinline__ float sigmoid_approx(float x) {
-  using C = SigmoidCoeffs<Order, R>;
-  float clamped = fminf(fmaxf(x, -(float)R), (float)R);
-  float t = clamped * clamped;
-  if constexpr (Order >= 9) {
-    return 0.5f + clamped * (C::c1 + t * (C::c3 + t * (C::c5 + t * (C::c7 + t * C::c9))));
-  } else {
-    return 0.5f + clamped * (C::c1 + t * (C::c3 + t * (C::c5 + t * C::c7)));
-  }
-}
-
-__device__ __forceinline__ float silu(const float& val) {
-#ifdef FLASHINFER_SILU_APPROX
-  return val * sigmoid_approx(val);
-#else
-  return silu_exact(val);
-#endif
-}
+__device__ __forceinline__ float silu(const float& val) { return val / (1.0f + __expf(-val)); }
 
 // Fused silu+mul+quantize: avoids intermediate bf16/f16 round-trip between
 // silu_and_mul and cvt_warp_fp16_to_fp4. Keeps values in f32 throughout.
