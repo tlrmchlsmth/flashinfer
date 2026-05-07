@@ -25,7 +25,11 @@ import numpy as np
 import torch
 
 from flashinfer.testing.utils import bench_gpu_time
-from flashinfer.quantization.fp4_quantization import get_fp4_quantization_module
+from flashinfer.quantization.fp4_quantization import (
+    gen_fp4_quantization_sm100_module,
+    gen_fp4_quantization_sm110_module,
+    gen_fp4_quantization_sm120_module,
+)
 from flashinfer.utils import is_sm100a_supported
 
 FLOAT8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
@@ -49,19 +53,17 @@ def get_gpu_name():
 
 
 def get_module():
+    """Get the raw JIT module with TVM-FFI functions (not the SimpleNamespace wrapper)."""
     major, minor = torch.cuda.get_device_capability()
     cc = major * 10 + minor
     if cc >= 120:
-        backend = "120"
+        return gen_fp4_quantization_sm120_module().build_and_load()
     elif cc >= 110:
-        backend = "110"
-    elif cc >= 103:
-        backend = "103"
+        return gen_fp4_quantization_sm110_module().build_and_load()
     elif cc >= 100:
-        backend = "100"
+        return gen_fp4_quantization_sm100_module().build_and_load()
     else:
         raise RuntimeError(f"SM{cc} does not support FP4 quantization (need SM100+)")
-    return get_fp4_quantization_module(backend)
 
 
 def round_up(x, multiple):
