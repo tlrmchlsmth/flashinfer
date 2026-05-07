@@ -652,23 +652,28 @@ cvt_fp16_to_fp4_expert(
     }
 
     int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
-    PackedVecT in_vec;
-    loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
-    if (use_silu_and_mul) {
-      PackedVecT in_vec_mul;
-      loadPackedVec(in_vec_mul, reinterpret_cast<PackedVecT const*>(in) + inOffset + colsPerRow);
-      silu_and_mul<Type, CVT_FP16_TO_FP4_ELTS_PER_THREAD>(in_vec, in_vec_mul);
-    }
-
     int64_t outOffset = rowIdx * colsPerRow + colIdx;
 
     auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE,
                                                      CVT_FP4_NUM_THREADS_PER_SF>(
         rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
 
-    reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
-        cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
-            in_vec, SFScaleVal, sf_out);
+    if (use_silu_and_mul) {
+      PackedVecT gate_vec, up_vec;
+      loadPackedVec(gate_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
+      loadPackedVec(up_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset + colsPerRow);
+      reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
+          cvt_silu_mul_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE,
+                                   CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
+              gate_vec, up_vec, SFScaleVal, sf_out);
+    } else {
+      PackedVecT in_vec;
+      loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
+      reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
+          cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE,
+                               CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
+              in_vec, SFScaleVal, sf_out);
+    }
   }
 #endif
 }
