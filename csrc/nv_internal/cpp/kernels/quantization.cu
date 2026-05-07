@@ -648,7 +648,8 @@ void invokeBlockScaleInterleaveReverse(int b, int m, int n, uint8_t const* SFIn,
 template <typename T>
 void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* input,
                                        void* input_global_scale, void* mask, bool use_silu_and_mul,
-                                       int m_topk, int k, int n_experts, cudaStream_t stream) {
+                                       int m_topk, int k, int n_experts, cudaStream_t stream,
+                                       int grid_size_override, int block_size_override) {
   int device;
   TLLM_CUDA_CHECK(cudaGetDevice(&device));
   int multiProcessorCount;
@@ -670,11 +671,21 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
     block.x = (block.x + 1) / 2;
   }
 
-  // TODO(kaixih@nvidia): Should relax this to allow any grid size.
-  // shuw@nvidia.com: only deal with mask case
   TLLM_CHECK_WITH_INFO(mask != nullptr, "mask must be non-null for expert NVFP4 path");
   TLLM_CHECK_WITH_INFO(n_experts > 0, "n_experts must be > 0");
   grid.x = (grid.x + n_experts - 1) / n_experts * n_experts;
+
+  if (grid_size_override > 0) {
+    TLLM_CHECK_WITH_INFO(grid_size_override % n_experts == 0,
+        "grid_size_override must be divisible by n_experts");
+    grid.x = grid_size_override;
+  }
+  if (block_size_override > 0) {
+    TLLM_CHECK_WITH_INFO(block_size_override <= 512,
+        "block_size_override must be <= 512 (launch_bounds)");
+    block.x = block_size_override;
+  }
+
   cvt_fp16_to_fp4_expert<T, false><<<grid, block, 0, stream>>>(
       m_topk, k, reinterpret_cast<T*>(input), reinterpret_cast<float*>(input_global_scale),
       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(output_scale),
@@ -702,7 +713,8 @@ template void invokeMxFP8Quantization<half>(int b, int m, int n, int padded_n, h
 template void invokeSiluAndMulNVFP4Quantization<half>(void* output, void* output_scale, void* input,
                                                       void* input_global_scale, void* mask,
                                                       bool use_silu_and_mul, int m_topk, int k,
-                                                      int n_experts, cudaStream_t stream);
+                                                      int n_experts, cudaStream_t stream,
+                                                      int grid_size_override, int block_size_override);
 
 #ifdef ENABLE_BF16
 template void invokeFP4Quantization<__nv_bfloat16, 16>(
@@ -720,7 +732,8 @@ template void invokeMxFP8Quantization<__nv_bfloat16>(int b, int m, int n, int pa
                                                      cudaStream_t stream);
 template void invokeSiluAndMulNVFP4Quantization<__nv_bfloat16>(
     void* output, void* output_scale, void* input, void* input_global_scale, void* mask,
-    bool use_silu_and_mul, int m_topk, int k, int n_experts, cudaStream_t stream);
+    bool use_silu_and_mul, int m_topk, int k, int n_experts, cudaStream_t stream,
+    int grid_size_override, int block_size_override);
 
 #endif
 

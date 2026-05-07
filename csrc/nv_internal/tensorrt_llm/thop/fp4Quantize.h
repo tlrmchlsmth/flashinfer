@@ -38,6 +38,13 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_sca
                                                 Tensor const input, Tensor const input_global_scale,
                                                 Tensor const mask, bool use_silu_and_mul);
 
+void silu_and_mul_scaled_nvfp4_experts_quantize_tuned(Tensor output, Tensor output_scale,
+                                                      Tensor const input,
+                                                      Tensor const input_global_scale,
+                                                      Tensor const mask, bool use_silu_and_mul,
+                                                      int64_t grid_size_override,
+                                                      int64_t block_size_override);
+
 void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv, TensorView output,
                                      TensorView output_scale, TensorView output_per_token_scale,
                                      Optional<TensorView> expanded_idx_to_permuted_idx,
