@@ -662,18 +662,20 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
 
   // Tuned grid/block for masked expert quantization (EP32 DeepSeek-R1, GB200).
   // The mask causes early-exit per expert, so oversized grids waste block
-  // scheduling overhead. Optimal grid ≈ real token count (unknown at launch),
-  // so we use a conservative lookup tuned on production shapes.
-  // Sweep data (real_tokens -> best_grid): 96->416, 192->480, 384->768,
-  // 512->512, 768->768, 1024->1024. Linearly interpolate by m_topk.
+  // scheduling overhead. Optimal grid tracks real token count, but we only
+  // know m_topk (padded) at launch. These values are swept on GB200 (152 SMs)
+  // across production shapes with realistic masks.
   struct TunedPoint { int m_topk; int grid; int block; };
   static constexpr TunedPoint kTuned[] = {
-      {   96, 416,  64},
-      {  384, 768, 128},
-      { 1024, 1024, 128},
-      { 3072, 1024, 128},
-      { 8192, 2048, 128},
-      {32768, 4096, 128},
+      {    96,  256,  64},
+      {   192,  384,  64},
+      {   384,  512, 128},
+      {   768,  768, 128},
+      {  1024, 1024, 128},
+      {  3072,  512, 128},
+      {  8192,  768, 128},
+      { 16384, 1024, 128},
+      { 32768, 1024, 128},
   };
   static constexpr int kNumTuned = sizeof(kTuned) / sizeof(kTuned[0]);
 
