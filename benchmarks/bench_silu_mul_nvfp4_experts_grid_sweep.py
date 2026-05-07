@@ -141,6 +141,37 @@ def time_it(fn, dry_run_iters, repeat_iters):
     return float(np.median(times)), float(np.std(times))
 
 
+def check_correctness(module, inputs_padded, inputs_real, n_experts, k, real_tokens, padded_tokens):
+    """Verify padded+masked output matches no-padding reference on real rows."""
+    tokens_per_expert_real = real_tokens // n_experts
+    tokens_per_expert_pad = padded_tokens // n_experts
+
+    # Compute reference with no padding
+    run_kernel_baseline(module, inputs_real)
+    torch.cuda.synchronize()
+    ref_out = inputs_real["output_flat"].clone()
+    ref_scales = inputs_real["output_scales_flat"].clone()
+
+    # Compute with padded input + mask
+    run_kernel_baseline(module, inputs_padded)
+    torch.cuda.synchronize()
+    pad_out = inputs_padded["output_flat"]
+    pad_scales = inputs_padded["output_scales_flat"]
+
+    # Compare only real rows per expert
+    ok = True
+    for e in range(n_experts):
+        ref_start = e * tokens_per_expert_real
+        pad_start = e * tokens_per_expert_pad
+        n = tokens_per_expert_real
+        if not torch.equal(ref_out[ref_start:ref_start+n], pad_out[pad_start:pad_start+n]):
+            ok = False
+            mismatches = (ref_out[ref_start:ref_start+n] != pad_out[pad_start:pad_start+n]).sum().item()
+            total = n * (k // 2)
+            print(f"    MISMATCH expert {e}: {mismatches}/{total} bytes differ")
+    return ok
+
+
 def get_grid_candidates(m_topk, k, n_experts, max_grid=8192):
     work_per_row = max(1, k // CVT_FP16_TO_FP4_ELTS_PER_THREAD)
     total_work = m_topk * work_per_row
@@ -215,6 +246,13 @@ def run_sweep(args):
         print(f"  Full compute (m_topk={padded_tokens:>5}, mask={padded_tokens:>5}): "
               f"{full_ms:.4f} ms  (mask saves {skip_speedup:.2f}x)")
 
+        # --- Correctness: padded+masked must match no-padding reference ---
+        correct = check_correctness(
+            module, inputs_padded, inputs_real, args.n_experts, args.k,
+            real_tokens, padded_tokens,
+        )
+        print(f"  Correctness (padded+mask vs no-pad): {'PASS' if correct else 'FAIL'}")
+
         # --- Grid sweep on the padded+masked case ---
         print(f"\n  Grid sweep (padded+masked):")
         grid_candidates = get_grid_candidates(padded_tokens, args.k, args.n_experts)
@@ -222,11 +260,19 @@ def run_sweep(args):
         total_configs = len(grid_candidates) * len(block_candidates)
         print(f"  {total_configs} configs: {len(grid_candidates)} grids x {len(block_candidates)} blocks")
 
-        print(f"  {'grid':>8} {'block':>6} {'ms':>9} {'vs_heur':>8} {'vs_nopad':>9}")
-        print(f"  {'-'*8} {'-'*6} {'-'*9} {'-'*8} {'-'*9}")
+        # Compute reference output for correctness checks
+        run_kernel_baseline(module, inputs_real)
+        torch.cuda.synchronize()
+        ref_out = inputs_real["output_flat"].clone()
+        tokens_per_expert_real = real_tokens // args.n_experts
+        tokens_per_expert_pad = padded_tokens // args.n_experts
+
+        print(f"  {'grid':>8} {'block':>6} {'ms':>9} {'vs_heur':>8} {'vs_nopad':>9} {'ok':>4}")
+        print(f"  {'-'*8} {'-'*6} {'-'*9} {'-'*8} {'-'*9} {'-'*4}")
 
         sweep_results = []
         best = {"grid_size": -1, "block_size": -1, "median_ms": float("inf")}
+        n_fail = 0
 
         for block_size in block_candidates:
             for grid_size in grid_candidates:
@@ -237,17 +283,36 @@ def run_sweep(args):
                 vs_heur = padded_masked_ms / ms if ms > 0 else 0
                 vs_nopad = ms / real_ms if real_ms > 0 else 0
 
+                # Correctness: run once outside graph, compare real rows
+                run_kernel(module, inputs_padded, grid_size, block_size)
+                torch.cuda.synchronize()
+                cfg_ok = True
+                for e in range(args.n_experts):
+                    rs = e * tokens_per_expert_real
+                    ps = e * tokens_per_expert_pad
+                    n = tokens_per_expert_real
+                    if not torch.equal(ref_out[rs:rs+n], inputs_padded["output_flat"][ps:ps+n]):
+                        cfg_ok = False
+                        break
+                if not cfg_ok:
+                    n_fail += 1
+
                 sweep_results.append({
                     "grid_size": grid_size,
                     "block_size": block_size,
                     "median_ms": ms,
                     "std_ms": std,
+                    "correct": cfg_ok,
                 })
 
                 if ms < best["median_ms"]:
                     best = {"grid_size": grid_size, "block_size": block_size, "median_ms": ms}
 
-                print(f"  {grid_size:>8} {block_size:>6} {ms:>9.4f} {vs_heur:>7.3f}x {vs_nopad:>8.2f}x")
+                ok_str = "Y" if cfg_ok else "FAIL"
+                print(f"  {grid_size:>8} {block_size:>6} {ms:>9.4f} {vs_heur:>7.3f}x {vs_nopad:>8.2f}x {ok_str:>4}")
+
+        if n_fail > 0:
+            print(f"\n  WARNING: {n_fail}/{total_configs} configs produced incorrect output!")
 
         best_vs_nopad = best["median_ms"] / real_ms if real_ms > 0 else 0
         best_vs_heur = padded_masked_ms / best["median_ms"] if best["median_ms"] > 0 else 0
@@ -263,6 +328,8 @@ def run_sweep(args):
             "full_compute_ms": full_ms,
             "mask_skip_speedup": skip_speedup,
             "padding_overhead": mask_overhead,
+            "heuristic_correct": correct,
+            "sweep_failures": n_fail,
             "best_grid": best["grid_size"],
             "best_block": best["block_size"],
             "best_ms": best["median_ms"],
