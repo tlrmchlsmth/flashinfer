@@ -131,7 +131,7 @@ def time_kernel(module, inputs, grid_size, block_size, dry_run_iters, repeat_ite
         dry_run_iters=dry_run_iters,
         repeat_iters=repeat_iters,
         cold_l2_cache=True,
-        use_cuda_graph=False,
+        use_cuda_graph=True,
     )
     return float(np.median(times)), float(np.std(times))
 
@@ -144,7 +144,7 @@ def time_kernel_baseline(module, inputs, dry_run_iters, repeat_iters):
         dry_run_iters=dry_run_iters,
         repeat_iters=repeat_iters,
         cold_l2_cache=True,
-        use_cuda_graph=False,
+        use_cuda_graph=True,
     )
     return float(np.median(times)), float(np.std(times))
 
