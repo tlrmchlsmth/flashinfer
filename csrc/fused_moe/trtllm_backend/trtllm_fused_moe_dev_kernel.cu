@@ -361,20 +361,20 @@ activationDeepSeekKernelV2(KernelParams params) {
   int const sfStride = totalPadded;
 
   int const hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x;
-  if (hiddenIdx >= params.innerDim / 2) return;
+  int const halfDim = params.innerDim / 2;
+  if (hiddenIdx >= halfDim) return;
+
+  // Hoist loop-invariant scale index bases
+  int const scaleBlockIdx = hiddenIdx / 128;
+  int64_t const scale1Base = (int64_t)sfStride * scaleBlockIdx;
+  int64_t const scale2Base = (int64_t)sfStride * (scaleBlockIdx + halfDim / 128);
 
   for (int permutedRow = blockIdx.y; permutedRow < totalPadded; permutedRow += gridDim.y) {
-    int64_t const baseIdx = (int64_t)permutedRow * params.innerDim + hiddenIdx;
-    int64_t const scale1Idx =
-        (int64_t)permutedRow + (int64_t)sfStride * (hiddenIdx / 128);
-    int64_t const scale2Idx =
-        (int64_t)permutedRow +
-        (int64_t)sfStride * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
-
-    float scale1 = params.inDqSfsPtr[scale1Idx];
-    float scale2 = params.inDqSfsPtr[scale2Idx];
-    float x1 = scale1 * static_cast<float>(params.inPtr[baseIdx]);
-    float x2 = scale2 * static_cast<float>(params.inPtr[baseIdx + params.innerDim / 2]);
+    int64_t const rowOffset = (int64_t)permutedRow * params.innerDim;
+    float scale1 = params.inDqSfsPtr[permutedRow + scale1Base];
+    float scale2 = params.inDqSfsPtr[permutedRow + scale2Base];
+    float x1 = scale1 * static_cast<float>(params.inPtr[rowOffset + hiddenIdx]);
+    float x2 = scale2 * static_cast<float>(params.inPtr[rowOffset + halfDim + hiddenIdx]);
 
     float out = silu(x2) * x1;
     float absOut = fabsf(out);
@@ -388,13 +388,11 @@ activationDeepSeekKernelV2(KernelParams params) {
     if (threadIdx.x == 0) {
       float scaleOut = fmaxf(aMax / E4m3MaxVal, std::numeric_limits<float>::min());
       s_scaleOut = scaleOut;
-      int64_t const scaleOutIdx =
-          (int64_t)permutedRow + (int64_t)sfStride * (hiddenIdx / 128);
-      params.outDqSfsPtr[scaleOutIdx] = scaleOut;
+      params.outDqSfsPtr[permutedRow + scale1Base] = scaleOut;
     }
     __syncthreads();
 
-    int64_t const outIdx = (int64_t)permutedRow * (params.innerDim / 2) + hiddenIdx;
+    int64_t const outIdx = (int64_t)permutedRow * halfDim + hiddenIdx;
     params.outPtr[outIdx] = static_cast<Type>(out / s_scaleOut);
   }
 }
@@ -437,7 +435,11 @@ void run(Data const& data, void* stream) {
     const dim3 grid(gridSizeX, gridSizeY, data.topK);
 
     {
-      int const gridSizeYV2 = std::min(8192, std::max(1, data.maxPermutedPaddedCount));
+      // Cap gridY to avoid launching excessive idle CTAs when maxPermutedPaddedCount
+      // is a worst-case upper bound much larger than the actual padded count (read on-device).
+      // The loop in activationDeepSeekKernelV2 handles gridY < totalPadded correctly.
+      int const maxConcurrentRows = numSms;
+      int const gridSizeYV2 = std::min(maxConcurrentRows, std::max(1, data.maxPermutedPaddedCount));
       const dim3 gridV2(gridSizeX, gridSizeYV2, 1);
       LAUNCH_ACTIVATION(data, activationDeepSeekKernelV2, 1, gridV2,
                         DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
