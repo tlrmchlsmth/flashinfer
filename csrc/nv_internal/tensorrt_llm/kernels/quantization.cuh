@@ -626,6 +626,10 @@ cvt_fp16_to_fp4_expert(
   int padded_m = (m + (128 - 1)) / 128 * 128;
 
   int colsPerRow = numCols / CVT_FP16_TO_FP4_ELTS_PER_THREAD;
+  // colsPerRow is always a power of 2 (numCols is multiple of SF_VEC_SIZE=16,
+  // ELTS_PER_THREAD is 8 or 16). Use bitshift instead of integer division.
+  int colsPerRow_shift = __ffs(colsPerRow) - 1;
+  int colsPerRow_mask = colsPerRow - 1;
   bool use_mask = mask != nullptr;
   int actualColsPerRow = use_silu_and_mul ? colsPerRow * 2 : colsPerRow;
 
@@ -639,8 +643,8 @@ cvt_fp16_to_fp4_expert(
 
   for (int globalIdx = tid_in_expert + expert_idx * m * colsPerRow;
        globalIdx < (expert_idx + 1) * m * colsPerRow; globalIdx += actual_stride) {
-    int rowIdx = globalIdx / colsPerRow;
-    int colIdx = globalIdx % colsPerRow;
+    int rowIdx = globalIdx >> colsPerRow_shift;
+    int colIdx = globalIdx & colsPerRow_mask;
     int rowIdx_in_expert = rowIdx - expert_idx * m;
 
     if (rowIdx_in_expert >= mask_limit) {
