@@ -822,12 +822,10 @@ __device__ __forceinline__ float sigmoid_approx(float x) {
   using C = SigmoidCoeffs<Order, R>;
   float clamped = fminf(fmaxf(x, -(float)R), (float)R);
   float t = clamped * clamped;
-  if constexpr (Order == 9) {
+  if constexpr (Order >= 9) {
     return 0.5f + clamped * (C::c1 + t * (C::c3 + t * (C::c5 + t * (C::c7 + t * C::c9))));
-  } else if constexpr (Order == 7) {
-    return 0.5f + clamped * (C::c1 + t * (C::c3 + t * (C::c5 + t * C::c7)));
   } else {
-    static_assert(Order == 7 || Order == 9, "Only order 7 and 9 are supported");
+    return 0.5f + clamped * (C::c1 + t * (C::c3 + t * (C::c5 + t * C::c7)));
   }
 }
 
