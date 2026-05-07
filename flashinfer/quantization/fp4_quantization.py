@@ -197,11 +197,13 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
+            "-DFLASHINFER_SILU_APPROX" if os.environ.get("FLASHINFER_SILU_APPROX") else "",
         ],
         extra_cflags=[
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
+            "-DFLASHINFER_SILU_APPROX" if os.environ.get("FLASHINFER_SILU_APPROX") else "",
         ],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
