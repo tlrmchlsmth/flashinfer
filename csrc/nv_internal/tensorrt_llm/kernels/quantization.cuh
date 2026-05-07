@@ -626,24 +626,24 @@ cvt_fp16_to_fp4_expert(
   int padded_m = (m + (128 - 1)) / 128 * 128;
 
   int colsPerRow = numCols / CVT_FP16_TO_FP4_ELTS_PER_THREAD;
-  // TODO(kaixih@nvidia): For now, we assume mask is used together with
-  // silu_and_mal. Maybe we want a more general behavior of mask later. In the
-  // silu case, the input last dim doubles.
   bool use_mask = mask != nullptr;
   int actualColsPerRow = use_silu_and_mul ? colsPerRow * 2 : colsPerRow;
 
-  // Each global thread processes one element
+  // Hoist loop-invariant computations
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[expert_idx];
+  constexpr int factor = CVT_FP4_SF_VEC_SIZE * 4;
+  int32_t numCols_padded = (numCols + factor - 1) / factor * factor;
+  int numCols_SFout = numCols_padded / CVT_FP4_SF_VEC_SIZE / 4;
+  uint32_t* SFout_in_expert = SFout + expert_idx * padded_m * numCols_SFout;
+  int mask_limit = use_mask ? mask[expert_idx] : m;
+
   for (int globalIdx = tid_in_expert + expert_idx * m * colsPerRow;
        globalIdx < (expert_idx + 1) * m * colsPerRow; globalIdx += actual_stride) {
-    // Calculate which row and column this global thread should process
     int rowIdx = globalIdx / colsPerRow;
     int colIdx = globalIdx % colsPerRow;
-
-    // Find index within the experts
     int rowIdx_in_expert = rowIdx - expert_idx * m;
 
-    // Early exit when using masks.
-    if (use_mask && rowIdx_in_expert >= mask[expert_idx]) {
+    if (rowIdx_in_expert >= mask_limit) {
       break;
     }
 
@@ -656,21 +656,7 @@ cvt_fp16_to_fp4_expert(
       silu_and_mul<Type, CVT_FP16_TO_FP4_ELTS_PER_THREAD>(in_vec, in_vec_mul);
     }
 
-    // Get the output tensor offset.
-    // Same as inOffset because CVT_FP16_TO_FP4_ELTS_PER_THREAD elements are
-    // packed into one PackedFp4OutT (uint32_t for 8 elts, uint64_t for 16 elts).
     int64_t outOffset = rowIdx * colsPerRow + colIdx;
-
-    // Get the global scaling factor, which will be applied to the SF.
-    // Note SFScale is the same as next GEMM's alpha, which is
-    // (448.f / (Alpha_A / 6.f)).
-    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[expert_idx];
-
-    int factor = CVT_FP4_SF_VEC_SIZE * 4;
-    // The actual output_scales dim is computed from the padded numCols.
-    int32_t numCols_padded = (numCols + factor - 1) / factor * factor;
-    int numCols_SFout = numCols_padded / CVT_FP4_SF_VEC_SIZE / 4;
-    uint32_t* SFout_in_expert = SFout + expert_idx * padded_m * numCols_SFout;
 
     auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE,
                                                      CVT_FP4_NUM_THREADS_PER_SF>(
