@@ -1,18 +1,13 @@
 """
 Grid/block sweep for silu_and_mul_scaled_nvfp4_experts_quantize kernel.
 
-Measures kernel latency across a matrix of (grid_size, block_size) for each
-production-representative token count, targeting EP_size=32 DeepSeek-R1 shapes.
+Measures kernel latency across production EP32 DeepSeek-R1 shapes, including
+the cost of padding (real vs padded token counts with mask-based early exit).
+
+Uses CUDA graphs with multiple replays per graph to eliminate launch overhead.
 
 Usage:
-    # Full sweep (all production shapes)
     python bench_silu_mul_nvfp4_experts_grid_sweep.py --output-dir /path/to/results
-
-    # Quick test with specific shapes
-    python bench_silu_mul_nvfp4_experts_grid_sweep.py --output-dir ./results --m-topk 3072 32768
-
-    # With correctness verification
-    python bench_silu_mul_nvfp4_experts_grid_sweep.py --output-dir ./results --verify
 """
 
 import argparse
@@ -35,17 +30,25 @@ from flashinfer.utils import is_sm100a_supported
 FLOAT8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 FLOAT4_E2M1_MAX = 6.0
 
-# DeepSeek-R1 with EP_size=32
 DEFAULT_K = 2048
 DEFAULT_N_EXPERTS = 8
 CVT_FP16_TO_FP4_ELTS_PER_THREAD = 16  # Blackwell (SM100+)
+CUDA_GRAPH_ITERS = 20  # replays within each CUDA graph capture
 
-PRODUCTION_M_TOPK = [96, 192, 384, 768, 1536, 3072, 6144, 12288, 24576, 32768]
+# Production scenarios: (real_tokens, padded_tokens)
+# EP_size=32, so worst-case padding = 32x
+PRODUCTION_SCENARIOS = [
+    (96, 3072),
+    (192, 3072),
+    (384, 3072),
+    (512, 8192),
+    (768, 8192),
+    (1024, 32768),
+]
 
 
 def get_sm_count():
-    props = torch.cuda.get_device_properties(0)
-    return props.multi_processor_count
+    return torch.cuda.get_device_properties(0).multi_processor_count
 
 
 def get_gpu_name():
@@ -53,7 +56,7 @@ def get_gpu_name():
 
 
 def get_module():
-    """Get the raw JIT module with TVM-FFI functions (not the SimpleNamespace wrapper)."""
+    """Get the raw JIT module with TVM-FFI functions."""
     major, minor = torch.cuda.get_device_capability()
     cc = major * 10 + minor
     if cc >= 120:
@@ -70,13 +73,15 @@ def round_up(x, multiple):
     return (x + multiple - 1) // multiple * multiple
 
 
-def create_test_inputs(m_topk, k, n_experts, device="cuda", dtype=torch.bfloat16):
+def create_test_inputs(m_topk, real_tokens, k, n_experts, device="cuda", dtype=torch.bfloat16):
+    """Create inputs with m_topk padded rows but mask set to real_tokens."""
     k_by_2 = k * 2
     sf_vec_size = 16
     tokens_per_expert = m_topk // n_experts
+    real_per_expert = real_tokens // n_experts
 
     x = torch.randn(n_experts, tokens_per_expert, k_by_2, dtype=dtype, device=device)
-    mask = torch.full((n_experts,), tokens_per_expert, dtype=torch.int32, device=device)
+    mask = torch.full((n_experts,), real_per_expert, dtype=torch.int32, device=device)
 
     ref_silu = torch.nn.functional.silu(x[..., :k]) * x[..., k:]
     tensor_amax = ref_silu.abs().amax(dim=(1, 2)).to(torch.float32)
@@ -123,8 +128,7 @@ def run_kernel_baseline(module, inputs):
     )
 
 
-def time_kernel(module, inputs, grid_size, block_size, dry_run_iters, repeat_iters):
-    fn = functools.partial(run_kernel, module, inputs, grid_size, block_size)
+def time_it(fn, dry_run_iters, repeat_iters):
     times = bench_gpu_time(
         fn,
         enable_cupti=True,
@@ -132,27 +136,9 @@ def time_kernel(module, inputs, grid_size, block_size, dry_run_iters, repeat_ite
         repeat_iters=repeat_iters,
         cold_l2_cache=True,
         use_cuda_graph=True,
+        num_iters_within_graph=CUDA_GRAPH_ITERS,
     )
     return float(np.median(times)), float(np.std(times))
-
-
-def time_kernel_baseline(module, inputs, dry_run_iters, repeat_iters):
-    fn = functools.partial(run_kernel_baseline, module, inputs)
-    times = bench_gpu_time(
-        fn,
-        enable_cupti=True,
-        dry_run_iters=dry_run_iters,
-        repeat_iters=repeat_iters,
-        cold_l2_cache=True,
-        use_cuda_graph=True,
-    )
-    return float(np.median(times)), float(np.std(times))
-
-
-def verify_output(module, inputs, grid_size, block_size, reference_output):
-    run_kernel(module, inputs, grid_size, block_size)
-    torch.cuda.synchronize()
-    return torch.equal(inputs["output_flat"], reference_output)
 
 
 def get_grid_candidates(m_topk, k, n_experts, max_grid=8192):
@@ -175,114 +161,7 @@ def get_grid_candidates(m_topk, k, n_experts, max_grid=8192):
 
 def get_block_candidates(k):
     work_per_row = max(1, k // CVT_FP16_TO_FP4_ELTS_PER_THREAD)
-    candidates = []
-    for b in [64, 128, 256, 512]:
-        if b <= work_per_row:
-            candidates.append(b)
-    return candidates if candidates else [64]
-
-
-def run_sweep_for_shape(module, m_topk, k, n_experts, args):
-    print(f"\n{'='*70}")
-    print(f"  m_topk={m_topk}  K={k}  n_experts={n_experts}")
-    print(f"{'='*70}")
-
-    inputs = create_test_inputs(m_topk, k, n_experts)
-
-    # Baseline (heuristic)
-    print("  Timing heuristic baseline...", flush=True)
-    baseline_ms, baseline_std = time_kernel_baseline(
-        module, inputs, args.dry_run_iters, args.repeat_iters
-    )
-    print(f"  Heuristic: {baseline_ms:.4f} ms (std={baseline_std:.4f})")
-
-    if args.verify:
-        run_kernel_baseline(module, inputs)
-        torch.cuda.synchronize()
-        reference_output = inputs["output_flat"].clone()
-    else:
-        reference_output = None
-
-    grid_candidates = get_grid_candidates(m_topk, k, n_experts)
-    block_candidates = get_block_candidates(k)
-
-    total_configs = len(grid_candidates) * len(block_candidates)
-    print(f"  Sweeping {total_configs} configs: "
-          f"{len(grid_candidates)} grids x {len(block_candidates)} blocks")
-
-    col_g, col_b, col_t, col_std, col_su, col_c = 10, 10, 12, 10, 10, 8
-    print(f"  {'grid':>{col_g}} {'block':>{col_b}} {'median_ms':>{col_t}} "
-          f"{'std_ms':>{col_std}} {'speedup':>{col_su}}"
-          + (f" {'correct':>{col_c}}" if args.verify else ""))
-    print(f"  {'-'*col_g} {'-'*col_b} {'-'*col_t} {'-'*col_std} {'-'*col_su}"
-          + (f" {'-'*col_c}" if args.verify else ""))
-
-    results = []
-    best = {"grid_size": -1, "block_size": -1, "median_ms": float("inf")}
-    idx = 0
-
-    for block_size in block_candidates:
-        for grid_size in grid_candidates:
-            idx += 1
-            median_ms, std_ms = time_kernel(
-                module, inputs, grid_size, block_size,
-                args.dry_run_iters, args.repeat_iters,
-            )
-            speedup = baseline_ms / median_ms if median_ms > 0 else 0
-
-            correct = None
-            if args.verify:
-                correct = verify_output(module, inputs, grid_size, block_size, reference_output)
-
-            result = {
-                "grid_size": grid_size,
-                "block_size": block_size,
-                "median_ms": median_ms,
-                "std_ms": std_ms,
-                "speedup_vs_heuristic": speedup,
-            }
-            if correct is not None:
-                result["correct"] = correct
-
-            results.append(result)
-
-            if median_ms < best["median_ms"]:
-                best = {"grid_size": grid_size, "block_size": block_size, "median_ms": median_ms}
-
-            correct_str = f" {'OK' if correct else 'FAIL':>{col_c}}" if correct is not None else ""
-            print(f"  {grid_size:>{col_g}} {block_size:>{col_b}} {median_ms:>{col_t}.4f} "
-                  f"{std_ms:>{col_std}.4f} {speedup:>{col_su}.3f}x{correct_str}")
-
-    best_speedup = baseline_ms / best["median_ms"] if best["median_ms"] > 0 else 0
-    print(f"\n  Best: grid={best['grid_size']} block={best['block_size']} "
-          f"{best['median_ms']:.4f}ms ({best_speedup:.3f}x vs heuristic)")
-
-    return {
-        "metadata": {
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "gpu_name": get_gpu_name(),
-            "sm_count": get_sm_count(),
-            "k": k,
-            "n_experts": n_experts,
-            "m_topk": m_topk,
-            "tokens_per_expert": m_topk // n_experts,
-            "elts_per_thread": CVT_FP16_TO_FP4_ELTS_PER_THREAD,
-            "dtype": "bfloat16",
-            "dry_run_iters": args.dry_run_iters,
-            "repeat_iters": args.repeat_iters,
-        },
-        "heuristic": {
-            "median_ms": baseline_ms,
-            "std_ms": baseline_std,
-        },
-        "results": results,
-        "best": {
-            "grid_size": best["grid_size"],
-            "block_size": best["block_size"],
-            "median_ms": best["median_ms"],
-            "speedup_vs_heuristic": best_speedup,
-        },
-    }
+    return [b for b in [64, 128, 256, 512] if b <= work_per_row] or [64]
 
 
 def run_sweep(args):
@@ -293,68 +172,151 @@ def run_sweep(args):
     print(f"GPU: {get_gpu_name()}")
     print(f"SM count: {get_sm_count()}")
     print(f"K={args.k}, n_experts={args.n_experts}")
+    print(f"CUDA graph replays per measurement: {CUDA_GRAPH_ITERS}")
 
     module = get_module()
-
-    m_topk_values = args.m_topk or PRODUCTION_M_TOPK
-    # m_topk must be divisible by n_experts
-    m_topk_values = [m for m in m_topk_values if m % args.n_experts == 0]
-
     os.makedirs(args.output_dir, exist_ok=True)
 
-    summary_rows = []
+    all_results = []
 
-    for m_topk in m_topk_values:
-        result = run_sweep_for_shape(module, m_topk, args.k, args.n_experts, args)
+    for real_tokens, padded_tokens in PRODUCTION_SCENARIOS:
+        print(f"\n{'='*78}")
+        print(f"  real={real_tokens}  padded={padded_tokens}  "
+              f"({padded_tokens // real_tokens}x padding)  "
+              f"K={args.k}  n_experts={args.n_experts}")
+        print(f"{'='*78}")
 
-        out_file = os.path.join(args.output_dir, f"sweep_m{m_topk}_k{args.k}.json")
+        # --- Baseline: no padding (m_topk = real, mask = real) ---
+        inputs_real = create_test_inputs(real_tokens, real_tokens, args.k, args.n_experts)
+        real_ms, real_std = time_it(
+            functools.partial(run_kernel_baseline, module, inputs_real),
+            args.dry_run_iters, args.repeat_iters,
+        )
+        print(f"  No padding  (m_topk={real_tokens:>5}, mask={real_tokens:>5}): "
+              f"{real_ms:.4f} ms")
+
+        # --- Padded with mask early-exit (m_topk = padded, mask = real) ---
+        inputs_padded = create_test_inputs(padded_tokens, real_tokens, args.k, args.n_experts)
+        padded_masked_ms, padded_masked_std = time_it(
+            functools.partial(run_kernel_baseline, module, inputs_padded),
+            args.dry_run_iters, args.repeat_iters,
+        )
+        mask_overhead = padded_masked_ms / real_ms if real_ms > 0 else 0
+        print(f"  Padded+mask  (m_topk={padded_tokens:>5}, mask={real_tokens:>5}): "
+              f"{padded_masked_ms:.4f} ms  ({mask_overhead:.2f}x vs no-pad)")
+
+        # --- Padded without mask skip (m_topk = padded, mask = padded = full compute) ---
+        inputs_full = create_test_inputs(padded_tokens, padded_tokens, args.k, args.n_experts)
+        full_ms, full_std = time_it(
+            functools.partial(run_kernel_baseline, module, inputs_full),
+            args.dry_run_iters, args.repeat_iters,
+        )
+        skip_speedup = full_ms / padded_masked_ms if padded_masked_ms > 0 else 0
+        print(f"  Full compute (m_topk={padded_tokens:>5}, mask={padded_tokens:>5}): "
+              f"{full_ms:.4f} ms  (mask saves {skip_speedup:.2f}x)")
+
+        # --- Grid sweep on the padded+masked case ---
+        print(f"\n  Grid sweep (padded+masked):")
+        grid_candidates = get_grid_candidates(padded_tokens, args.k, args.n_experts)
+        block_candidates = get_block_candidates(args.k)
+        total_configs = len(grid_candidates) * len(block_candidates)
+        print(f"  {total_configs} configs: {len(grid_candidates)} grids x {len(block_candidates)} blocks")
+
+        print(f"  {'grid':>8} {'block':>6} {'ms':>9} {'vs_heur':>8} {'vs_nopad':>9}")
+        print(f"  {'-'*8} {'-'*6} {'-'*9} {'-'*8} {'-'*9}")
+
+        sweep_results = []
+        best = {"grid_size": -1, "block_size": -1, "median_ms": float("inf")}
+
+        for block_size in block_candidates:
+            for grid_size in grid_candidates:
+                ms, std = time_it(
+                    functools.partial(run_kernel, module, inputs_padded, grid_size, block_size),
+                    args.dry_run_iters, args.repeat_iters,
+                )
+                vs_heur = padded_masked_ms / ms if ms > 0 else 0
+                vs_nopad = ms / real_ms if real_ms > 0 else 0
+
+                sweep_results.append({
+                    "grid_size": grid_size,
+                    "block_size": block_size,
+                    "median_ms": ms,
+                    "std_ms": std,
+                })
+
+                if ms < best["median_ms"]:
+                    best = {"grid_size": grid_size, "block_size": block_size, "median_ms": ms}
+
+                print(f"  {grid_size:>8} {block_size:>6} {ms:>9.4f} {vs_heur:>7.3f}x {vs_nopad:>8.2f}x")
+
+        best_vs_nopad = best["median_ms"] / real_ms if real_ms > 0 else 0
+        best_vs_heur = padded_masked_ms / best["median_ms"] if best["median_ms"] > 0 else 0
+        print(f"\n  Best: grid={best['grid_size']} block={best['block_size']} "
+              f"{best['median_ms']:.4f}ms "
+              f"({best_vs_heur:.3f}x vs heuristic, {best_vs_nopad:.2f}x vs no-pad)")
+
+        scenario_result = {
+            "real_tokens": real_tokens,
+            "padded_tokens": padded_tokens,
+            "no_padding_ms": real_ms,
+            "padded_masked_ms": padded_masked_ms,
+            "full_compute_ms": full_ms,
+            "mask_skip_speedup": skip_speedup,
+            "padding_overhead": mask_overhead,
+            "best_grid": best["grid_size"],
+            "best_block": best["block_size"],
+            "best_ms": best["median_ms"],
+            "best_vs_heuristic": best_vs_heur,
+            "best_vs_nopad": best_vs_nopad,
+            "sweep_results": sweep_results,
+        }
+
+        out_file = os.path.join(
+            args.output_dir,
+            f"sweep_real{real_tokens}_pad{padded_tokens}_k{args.k}.json",
+        )
         with open(out_file, "w") as f:
-            json.dump(result, f, indent=2)
-        print(f"  Saved: {out_file}")
+            json.dump(scenario_result, f, indent=2)
+        all_results.append(scenario_result)
 
-        summary_rows.append({
-            "m_topk": m_topk,
-            "best_grid": result["best"]["grid_size"],
-            "best_block": result["best"]["block_size"],
-            "best_ms": result["best"]["median_ms"],
-            "heuristic_ms": result["heuristic"]["median_ms"],
-            "speedup": result["best"]["speedup_vs_heuristic"],
-        })
+    # Summary
+    print(f"\n{'='*78}")
+    print("SUMMARY")
+    print(f"{'='*78}")
+    print(f"  {'real':>6} {'padded':>7} {'no_pad':>8} {'pad+mask':>9} {'full':>8} "
+          f"{'mask_skip':>10} {'best_ms':>8} {'best_grid':>10} {'vs_nopad':>9}")
+    print(f"  {'-'*6} {'-'*7} {'-'*8} {'-'*9} {'-'*8} "
+          f"{'-'*10} {'-'*8} {'-'*10} {'-'*9}")
+    for r in all_results:
+        print(f"  {r['real_tokens']:>6} {r['padded_tokens']:>7} "
+              f"{r['no_padding_ms']:>8.4f} {r['padded_masked_ms']:>9.4f} "
+              f"{r['full_compute_ms']:>8.4f} {r['mask_skip_speedup']:>9.2f}x "
+              f"{r['best_ms']:>8.4f} {r['best_grid']:>10} "
+              f"{r['best_vs_nopad']:>8.2f}x")
 
-    # Write summary CSV
     csv_file = os.path.join(args.output_dir, "summary.csv")
     with open(csv_file, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=summary_rows[0].keys())
+        fieldnames = [
+            "real_tokens", "padded_tokens", "no_padding_ms", "padded_masked_ms",
+            "full_compute_ms", "mask_skip_speedup", "best_ms", "best_grid",
+            "best_block", "best_vs_heuristic", "best_vs_nopad",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(summary_rows)
-    print(f"\nSummary saved: {csv_file}")
-
-    # Print summary table
-    print(f"\n{'='*70}")
-    print("SUMMARY")
-    print(f"{'='*70}")
-    print(f"  {'m_topk':>8} {'best_grid':>10} {'best_block':>11} "
-          f"{'best_ms':>9} {'heur_ms':>9} {'speedup':>8}")
-    print(f"  {'-'*8} {'-'*10} {'-'*11} {'-'*9} {'-'*9} {'-'*8}")
-    for row in summary_rows:
-        print(f"  {row['m_topk']:>8} {row['best_grid']:>10} {row['best_block']:>11} "
-              f"{row['best_ms']:>9.4f} {row['heuristic_ms']:>9.4f} {row['speedup']:>7.3f}x")
+        for r in all_results:
+            writer.writerow({k: r[k] for k in fieldnames})
+    print(f"\nSaved: {csv_file}")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Grid/block sweep for silu_and_mul_scaled_nvfp4_experts_quantize"
     )
-    parser.add_argument("--output-dir", required=True, help="Directory for result JSON/CSV files")
-    parser.add_argument("--m-topk", nargs="+", type=int, default=None,
-                        help="m_topk values to test (default: production range 96-32768)")
-    parser.add_argument("--k", type=int, default=DEFAULT_K, help="Hidden dim (default: 2048)")
-    parser.add_argument("--n-experts", type=int, default=DEFAULT_N_EXPERTS,
-                        help="Local experts per GPU (default: 8)")
-    parser.add_argument("--repeat-iters", type=int, default=50, help="Timing iterations")
-    parser.add_argument("--dry-run-iters", type=int, default=10, help="Warmup iterations")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify correctness of each config against heuristic baseline")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--k", type=int, default=DEFAULT_K)
+    parser.add_argument("--n-experts", type=int, default=DEFAULT_N_EXPERTS)
+    parser.add_argument("--repeat-iters", type=int, default=50)
+    parser.add_argument("--dry-run-iters", type=int, default=10)
     args = parser.parse_args()
     run_sweep(args)
 
