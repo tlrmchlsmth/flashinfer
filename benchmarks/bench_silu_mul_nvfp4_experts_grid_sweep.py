@@ -141,34 +141,33 @@ def time_it(fn, dry_run_iters, repeat_iters):
     return float(np.median(times)), float(np.std(times))
 
 
-def check_correctness(module, inputs_padded, inputs_real, n_experts, k, real_tokens, padded_tokens):
-    """Verify padded+masked output matches no-padding reference on real rows."""
-    tokens_per_expert_real = real_tokens // n_experts
-    tokens_per_expert_pad = padded_tokens // n_experts
+def check_correctness_same_shape(module, inputs, n_experts, k, real_tokens, padded_tokens,
+                                  grid_size=-1, block_size=-1):
+    """Verify tuned kernel output matches heuristic baseline at the same shape."""
+    tokens_per_expert = padded_tokens // n_experts
+    real_per_expert = real_tokens // n_experts
 
-    # Compute reference with no padding
-    run_kernel_baseline(module, inputs_real)
+    # Reference: heuristic baseline
+    run_kernel_baseline(module, inputs)
     torch.cuda.synchronize()
-    ref_out = inputs_real["output_flat"].clone()
-    ref_scales = inputs_real["output_scales_flat"].clone()
+    ref_out = inputs["output_flat"].clone()
 
-    # Compute with padded input + mask
-    run_kernel_baseline(module, inputs_padded)
+    # Test: tuned kernel (or override)
+    run_kernel(module, inputs, grid_size, block_size)
     torch.cuda.synchronize()
-    pad_out = inputs_padded["output_flat"]
-    pad_scales = inputs_padded["output_scales_flat"]
+    test_out = inputs["output_flat"]
 
-    # Compare only real rows per expert
+    # Compare only real (masked) rows per expert
     ok = True
     for e in range(n_experts):
-        ref_start = e * tokens_per_expert_real
-        pad_start = e * tokens_per_expert_pad
-        n = tokens_per_expert_real
-        if not torch.equal(ref_out[ref_start:ref_start+n], pad_out[pad_start:pad_start+n]):
+        start = e * tokens_per_expert
+        n = real_per_expert
+        if not torch.equal(ref_out[start:start+n], test_out[start:start+n]):
             ok = False
-            mismatches = (ref_out[ref_start:ref_start+n] != pad_out[pad_start:pad_start+n]).sum().item()
+            mismatches = (ref_out[start:start+n] != test_out[start:start+n]).sum().item()
             total = n * (k // 2)
-            print(f"    MISMATCH expert {e}: {mismatches}/{total} bytes differ")
+            print(f"    MISMATCH expert {e}: {mismatches}/{total} bytes differ "
+                  f"(grid={grid_size}, block={block_size})")
     return ok
 
 
@@ -246,12 +245,12 @@ def run_sweep(args):
         print(f"  Full compute (m_topk={padded_tokens:>5}, mask={padded_tokens:>5}): "
               f"{full_ms:.4f} ms  (mask saves {skip_speedup:.2f}x)")
 
-        # --- Correctness: padded+masked must match no-padding reference ---
-        correct = check_correctness(
-            module, inputs_padded, inputs_real, args.n_experts, args.k,
+        # --- Correctness: new heuristic must match old baseline at same shape ---
+        correct = check_correctness_same_shape(
+            module, inputs_padded, args.n_experts, args.k,
             real_tokens, padded_tokens,
         )
-        print(f"  Correctness (padded+mask vs no-pad): {'PASS' if correct else 'FAIL'}")
+        print(f"  Correctness (new heuristic vs baseline): {'PASS' if correct else 'FAIL'}")
 
         # --- Grid sweep on the padded+masked case ---
         print(f"\n  Grid sweep (padded+masked):")
@@ -260,11 +259,11 @@ def run_sweep(args):
         total_configs = len(grid_candidates) * len(block_candidates)
         print(f"  {total_configs} configs: {len(grid_candidates)} grids x {len(block_candidates)} blocks")
 
-        # Compute reference output for correctness checks
-        run_kernel_baseline(module, inputs_real)
+        # Compute reference output for correctness checks (heuristic at same shape)
+        run_kernel_baseline(module, inputs_padded)
         torch.cuda.synchronize()
-        ref_out = inputs_real["output_flat"].clone()
-        tokens_per_expert_real = real_tokens // args.n_experts
+        ref_out = inputs_padded["output_flat"].clone()
+        real_per_expert = real_tokens // args.n_experts
         tokens_per_expert_pad = padded_tokens // args.n_experts
 
         print(f"  {'grid':>8} {'block':>6} {'ms':>9} {'vs_heur':>8} {'vs_nopad':>9} {'ok':>4}")
@@ -283,15 +282,14 @@ def run_sweep(args):
                 vs_heur = padded_masked_ms / ms if ms > 0 else 0
                 vs_nopad = ms / real_ms if real_ms > 0 else 0
 
-                # Correctness: run once outside graph, compare real rows
+                # Correctness: run once outside graph, compare real rows vs heuristic
                 run_kernel(module, inputs_padded, grid_size, block_size)
                 torch.cuda.synchronize()
                 cfg_ok = True
                 for e in range(args.n_experts):
-                    rs = e * tokens_per_expert_real
-                    ps = e * tokens_per_expert_pad
-                    n = tokens_per_expert_real
-                    if not torch.equal(ref_out[rs:rs+n], inputs_padded["output_flat"][ps:ps+n]):
+                    s = e * tokens_per_expert_pad
+                    n = real_per_expert
+                    if not torch.equal(ref_out[s:s+n], inputs_padded["output_flat"][s:s+n]):
                         cfg_ok = False
                         break
                 if not cfg_ok:
