@@ -33,7 +33,7 @@ FLOAT4_E2M1_MAX = 6.0
 DEFAULT_K = 2048
 DEFAULT_N_EXPERTS = 8
 CVT_FP16_TO_FP4_ELTS_PER_THREAD = 16  # Blackwell (SM100+)
-CUDA_GRAPH_ITERS = 20  # replays within each CUDA graph capture
+CUDA_GRAPH_ITERS = 200  # replays within each CUDA graph capture
 
 # Production scenarios: (real_tokens, padded_tokens)
 # EP_size=32, so worst-case padding = 32x
