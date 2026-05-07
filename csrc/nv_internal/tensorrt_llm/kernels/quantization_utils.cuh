@@ -831,14 +831,8 @@ __device__ __forceinline__ float sigmoid_approx(float x) {
   }
 }
 
-__device__ __forceinline__ float sigmoid_rsqrt(float x) {
-  return 0.5f + 0.5f * x * rsqrtf(1.0f + x * x);
-}
-
 __device__ __forceinline__ float silu(const float& val) {
-#if defined(FLASHINFER_SILU_RSQRT)
-  return val * sigmoid_rsqrt(val);
-#elif defined(FLASHINFER_SILU_APPROX)
+#ifdef FLASHINFER_SILU_APPROX
   return val * sigmoid_approx(val);
 #else
   return silu_exact(val);

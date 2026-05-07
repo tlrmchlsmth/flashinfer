@@ -88,14 +88,8 @@ inline __device__ float sigmoid_approx(float x) {
   }
 }
 
-inline __device__ float sigmoid_rsqrt(float x) {
-  return 0.5f + 0.5f * x * rsqrtf(1.0f + x * x);
-}
-
 inline __device__ float silu(float x) {
-#if defined(FLASHINFER_SILU_RSQRT)
-  return x * sigmoid_rsqrt(x);
-#elif defined(FLASHINFER_SILU_APPROX)
+#ifdef FLASHINFER_SILU_APPROX
   return x * sigmoid_approx(x);
 #else
   return silu_exact(x);
