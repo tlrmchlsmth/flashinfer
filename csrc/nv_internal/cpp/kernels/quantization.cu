@@ -656,24 +656,48 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
   TLLM_CUDA_CHECK(
       cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device));
 
-  // Grid, Block size.
-  // Each thread converts 8 values.
   TLLM_CHECK_WITH_INFO(k > 0, "k must be > 0");
-  int const workSizePerRow = max(1, k / CVT_FP16_TO_FP4_ELTS_PER_THREAD);
-  int const totalWorkSize = m_topk * workSizePerRow;
-  dim3 block(std::min(workSizePerRow, 512));
-  // Get number of blocks per SM (assume we can fully utilize the SM).
-  int const numBlocksPerSM = 2048 / block.x;
-  dim3 grid(std::min(static_cast<int>((totalWorkSize + block.x - 1) / block.x),
-                     multiProcessorCount * numBlocksPerSM));
-  while (grid.x <= multiProcessorCount && block.x > 64) {
-    grid.x *= 2;
-    block.x = (block.x + 1) / 2;
-  }
-
   TLLM_CHECK_WITH_INFO(mask != nullptr, "mask must be non-null for expert NVFP4 path");
   TLLM_CHECK_WITH_INFO(n_experts > 0, "n_experts must be > 0");
-  grid.x = (grid.x + n_experts - 1) / n_experts * n_experts;
+
+  // Tuned grid/block for masked expert quantization (EP32 DeepSeek-R1, GB200).
+  // The mask causes early-exit per expert, so oversized grids waste block
+  // scheduling overhead. Optimal grid ≈ real token count (unknown at launch),
+  // so we use a conservative lookup tuned on production shapes.
+  // Sweep data (real_tokens -> best_grid): 96->416, 192->480, 384->768,
+  // 512->512, 768->768, 1024->1024. Linearly interpolate by m_topk.
+  struct TunedPoint { int m_topk; int grid; int block; };
+  static constexpr TunedPoint kTuned[] = {
+      {   96, 416,  64},
+      {  384, 768, 128},
+      { 1024, 1024, 128},
+      { 3072, 1024, 128},
+      { 8192, 2048, 128},
+      {32768, 4096, 128},
+  };
+  static constexpr int kNumTuned = sizeof(kTuned) / sizeof(kTuned[0]);
+
+  int tuned_grid = kTuned[kNumTuned - 1].grid;
+  int tuned_block = kTuned[kNumTuned - 1].block;
+  for (int i = 0; i < kNumTuned; ++i) {
+    if (m_topk <= kTuned[i].m_topk) {
+      if (i == 0) {
+        tuned_grid = kTuned[0].grid;
+        tuned_block = kTuned[0].block;
+      } else {
+        float t = static_cast<float>(m_topk - kTuned[i-1].m_topk) /
+                  (kTuned[i].m_topk - kTuned[i-1].m_topk);
+        tuned_grid = kTuned[i-1].grid + static_cast<int>(t * (kTuned[i].grid - kTuned[i-1].grid));
+        tuned_block = kTuned[i].block;
+      }
+      break;
+    }
+  }
+  // Round grid up to multiple of n_experts
+  tuned_grid = (tuned_grid + n_experts - 1) / n_experts * n_experts;
+
+  dim3 grid(tuned_grid);
+  dim3 block(tuned_block);
 
   if (grid_size_override > 0) {
     TLLM_CHECK_WITH_INFO(grid_size_override % n_experts == 0,
