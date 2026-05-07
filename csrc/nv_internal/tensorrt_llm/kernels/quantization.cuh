@@ -662,13 +662,38 @@ cvt_fp16_to_fp4_expert(
 
     int64_t outOffset = rowIdx * colsPerRow + colIdx;
 
-    auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE,
-                                                     CVT_FP4_NUM_THREADS_PER_SF>(
-        rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
-
+    // Compute FP4 quantization, deferring the SF write
+    uint8_t my_sf;
     reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
-        cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
-            in_vec, SFScaleVal, sf_out);
+        cvt_warp_fp16_to_fp4_deferred_sf<Type, CVT_FP4_SF_VEC_SIZE,
+                                         CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
+            in_vec, SFScaleVal, my_sf);
+
+    // Pack 4 adjacent threads' SF bytes into a single uint32_t write (STG.32).
+    // The swizzle layout places consecutive innerKIdx values at consecutive
+    // bytes, so 4 adjacent colIdx threads' SFs are contiguous in memory.
+    if constexpr (CVT_FP4_NUM_THREADS_PER_SF == 1) {
+      int lane_in_group = colIdx & 3;
+      uint32_t shifted = static_cast<uint32_t>(my_sf) << (lane_in_group * 8);
+      shifted |= __shfl_xor_sync(0xffffffff, shifted, 1);
+      shifted |= __shfl_xor_sync(0xffffffff, shifted, 2);
+      if (lane_in_group == 0) {
+        auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE,
+                                                         CVT_FP4_NUM_THREADS_PER_SF>(
+            rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
+        if (sf_out) {
+          *reinterpret_cast<uint32_t*>(sf_out) = shifted;
+        }
+      }
+    } else {
+      // Fallback for NUM_THREADS_PER_SF > 1: use original per-byte write
+      auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE,
+                                                       CVT_FP4_NUM_THREADS_PER_SF>(
+          rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
+      if (sf_out) {
+        *sf_out = my_sf;
+      }
+    }
   }
 #endif
 }
