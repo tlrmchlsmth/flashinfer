@@ -32,7 +32,13 @@ constexpr int THREADS_PER_SCALE_BLOCK = ELTS_PER_SCALE_BLOCK / ELTS_PER_THREAD; 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// 2 SFU ops: MUFU.EX2 + MUFU.RCP
 __device__ __forceinline__ float silu_f(float x) { return x / (1.0f + expf(-x)); }
+
+// 1 SFU op: MUFU.TANH + 1 FFMA
+__device__ __forceinline__ float silu_tanh(float x) {
+  return x * (0.5f + 0.5f * __tanhf(x * 0.5f));
+}
 
 __device__ __forceinline__ float warp_reduce_max(float val) {
   val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 16));
@@ -123,7 +129,7 @@ __global__ void __launch_bounds__(V2_THREADS_PER_CTA)
 // Scale loads via lane-0 + __shfl broadcast (avoids uncoalesced sector waste).
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int WarpsPerCta>
+template <int WarpsPerCta, bool UseTanhSilu = false>
 __global__ void __launch_bounds__(WarpsPerCta * 32)
     activationDeepSeekKernelVec(ActivationDeepSeekParams params) {
   float constexpr E4m3MaxVal{448.f};
@@ -179,7 +185,11 @@ __global__ void __launch_bounds__(WarpsPerCta * 32)
     for (int i = 0; i < 4; i++) {
       float f1 = scale1 * static_cast<float>(x1_vals[i]);
       float f2 = scale2 * static_cast<float>(x2_vals[i]);
-      results[i] = silu_f(f2) * f1;
+      if constexpr (UseTanhSilu) {
+        results[i] = silu_tanh(f2) * f1;
+      } else {
+        results[i] = silu_f(f2) * f1;
+      }
       localMax = fmaxf(localMax, fabsf(results[i]));
     }
 
@@ -227,7 +237,7 @@ static void launchActivationV2(
   activationDeepSeekKernelV2<<<grid, V2_THREADS_PER_CTA, 0, stream>>>(params);
 }
 
-template <int WarpsPerCta>
+template <int WarpsPerCta, bool UseTanhSilu = false>
 static void launchActivationVec(
     ActivationDeepSeekParams& params, int32_t maxPermutedPaddedCount,
     int32_t gridY_override, cudaStream_t stream) {
@@ -246,7 +256,7 @@ static void launchActivationVec(
                       : min(numSms, max(1, maxPermutedPaddedCount));
 
   dim3 grid(gridSizeX, gridSizeY, 1);
-  activationDeepSeekKernelVec<WarpsPerCta>
+  activationDeepSeekKernelVec<WarpsPerCta, UseTanhSilu>
       <<<grid, WarpsPerCta * 32, 0, stream>>>(params);
 }
 
@@ -362,6 +372,31 @@ void activation_deepseek_fp8_v4_tuned(Tensor input, Tensor input_scales,
                          get_stream(input.device()));
 }
 
+// V5: tanh-based silu (1 SFU op instead of 2), 4 warps/CTA
+void activation_deepseek_fp8_v5(Tensor input, Tensor input_scales,
+                                Tensor output, Tensor output_scales,
+                                Tensor total_padded_tokens,
+                                int64_t inner_dim) {
+  checkInputs(input, input_scales, output, output_scales, total_padded_tokens);
+  auto params = makeParams(input, input_scales, output, output_scales,
+                            total_padded_tokens, inner_dim);
+  launchActivationVec<4, true>(params, static_cast<int32_t>(input.shape()[0]),
+                               -1, get_stream(input.device()));
+}
+
+void activation_deepseek_fp8_v5_tuned(Tensor input, Tensor input_scales,
+                                      Tensor output, Tensor output_scales,
+                                      Tensor total_padded_tokens,
+                                      int64_t inner_dim,
+                                      int64_t grid_y_override) {
+  checkInputs(input, input_scales, output, output_scales, total_padded_tokens);
+  auto params = makeParams(input, input_scales, output, output_scales,
+                            total_padded_tokens, inner_dim);
+  launchActivationVec<4, true>(params, static_cast<int32_t>(input.shape()[0]),
+                               static_cast<int32_t>(grid_y_override),
+                               get_stream(input.device()));
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v2,
                               activation_deepseek_fp8_v2);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v2_tuned,
@@ -374,3 +409,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v4,
                               activation_deepseek_fp8_v4);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v4_tuned,
                               activation_deepseek_fp8_v4_tuned);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v5,
+                              activation_deepseek_fp8_v5);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v5_tuned,
+                              activation_deepseek_fp8_v5_tuned);

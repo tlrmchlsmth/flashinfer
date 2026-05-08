@@ -59,7 +59,7 @@ def main():
     parser.add_argument("--real-rows", type=int, default=1024)
     parser.add_argument("--padded-rows", type=int, default=32768)
     parser.add_argument("--inner-dim", type=int, default=2048)
-    parser.add_argument("--version", choices=["v2", "v3", "v4"], default="v4")
+    parser.add_argument("--version", choices=["v2", "v3", "v4", "v5"], default="v5")
     parser.add_argument("--grid-y", type=int, default=-1)
     args = parser.parse_args()
 

@@ -338,13 +338,13 @@ def run_sweep(args):
         )
 
         # --- Correctness checks ---
-        for ver in ["v2", "v3", "v4"]:
+        for ver in ["v2", "v3", "v4", "v5"]:
             ok = check_correctness(module, inputs_padded, version=ver)
             print(f"  {ver.upper()} correctness: {'PASS' if ok else 'FAIL'}")
 
         # --- V3/V4 default grid comparison ---
         version_results = {}
-        for ver in ["v3", "v4"]:
+        for ver in ["v3", "v4", "v5"]:
             ms, std = time_it(
                 functools.partial(run_kernel, module, inputs_padded, -1, ver),
                 args.dry_run_iters,
@@ -362,7 +362,7 @@ def run_sweep(args):
         # --- Grid Y sweep for V3 and V4 ---
         grid_y_candidates = get_grid_y_candidates(padded_rows, inner_dim, sm_count)
 
-        for ver in ["v3", "v4"]:
+        for ver in ["v3", "v4", "v5"]:
             print(f"\n  {ver.upper()} Grid Y sweep ({len(grid_y_candidates)} values):")
             print(
                 f"  {'gridY':>8} {'ms':>9} {'vs_v2h':>8} {'vs_nopad':>9} {'ok':>4}"
@@ -408,7 +408,7 @@ def run_sweep(args):
             "v2_padded_ms": padded_ms,
             "full_compute_ms": full_ms,
         }
-        for ver in ["v3", "v4"]:
+        for ver in ["v3", "v4", "v5"]:
             vr = version_results[ver]
             scenario_result[f"{ver}_default_ms"] = vr["default_ms"]
             scenario_result[f"{ver}_best_grid_y"] = vr["best_grid_y"]
@@ -424,42 +424,42 @@ def run_sweep(args):
 
     # Summary
     print(f"\n{'='*78}")
-    print("SUMMARY (V3 8-warp vs V4 4-warp vs V2 baseline)")
+    print("SUMMARY")
     print(f"{'='*78}")
     print(
         f"  {'real':>6} {'pad':>6} {'no_pad':>8} {'V2_heur':>8} "
-        f"{'V3_best':>8} {'V3_gY':>6} "
-        f"{'V4_best':>8} {'V4_gY':>6} "
-        f"{'V4/V2':>7} {'V4/np':>7}"
+        f"{'V4_best':>8} {'V5_best':>8} "
+        f"{'V5_gY':>6} {'V5/V2':>7} {'V5/np':>7}"
     )
     print(
         f"  {'-'*6} {'-'*6} {'-'*8} {'-'*8} "
-        f"{'-'*8} {'-'*6} "
-        f"{'-'*8} {'-'*6} "
-        f"{'-'*7} {'-'*7}"
+        f"{'-'*8} {'-'*8} "
+        f"{'-'*6} {'-'*7} {'-'*7}"
     )
     for r in all_results:
-        v4_vs_v2 = r["v2_padded_ms"] / r["v4_best_ms"] if r["v4_best_ms"] > 0 else 0
-        v4_vs_np = r["v4_best_ms"] / r["no_padding_ms"] if r["no_padding_ms"] > 0 else 0
+        best_ver = "v5" if r.get("v5_best_ms", float("inf")) <= r.get("v4_best_ms", float("inf")) else "v4"
+        best_ms = r[f"{best_ver}_best_ms"]
+        best_vs_v2 = r["v2_padded_ms"] / best_ms if best_ms > 0 else 0
+        best_vs_np = best_ms / r["no_padding_ms"] if r["no_padding_ms"] > 0 else 0
         print(
             f"  {r['real_rows']:>6} {r['padded_rows']:>6} "
             f"{r['no_padding_ms']:>8.4f} {r['v2_padded_ms']:>8.4f} "
-            f"{r['v3_best_ms']:>8.4f} {r['v3_best_grid_y']:>6} "
-            f"{r['v4_best_ms']:>8.4f} {r['v4_best_grid_y']:>6} "
-            f"{v4_vs_v2:>6.1f}x {v4_vs_np:>6.2f}x"
+            f"{r.get('v4_best_ms', 0):>8.4f} {r.get('v5_best_ms', 0):>8.4f} "
+            f"{r.get('v5_best_grid_y', 0):>6} "
+            f"{best_vs_v2:>6.1f}x {best_vs_np:>6.2f}x"
         )
 
     csv_file = os.path.join(args.output_dir, "summary.csv")
     with open(csv_file, "w", newline="") as f:
         fieldnames = [
             "real_rows", "padded_rows", "inner_dim", "no_padding_ms", "v2_padded_ms",
-            "v3_default_ms", "v3_best_ms", "v3_best_grid_y",
-            "v4_default_ms", "v4_best_ms", "v4_best_grid_y",
         ]
+        for ver in ["v3", "v4", "v5"]:
+            fieldnames += [f"{ver}_default_ms", f"{ver}_best_ms", f"{ver}_best_grid_y"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in all_results:
-            writer.writerow({k: r[k] for k in fieldnames})
+            writer.writerow({k: r.get(k, "") for k in fieldnames})
     print(f"\nSaved: {csv_file}")
 
 
