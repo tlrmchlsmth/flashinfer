@@ -30,7 +30,7 @@ from flashinfer.jit.fp8_activation_benchmark import gen_fp8_activation_benchmark
 CUDA_GRAPH_ITERS = 200
 
 # Production DeepSeek-R1 with EP_size=32:
-# K = innerDim passed to activation kernel
+# intermediate_size=18432, innerDim = 2 * 18432 = 36864 for SwiGLU
 # Each token routes to 6-10 experts; after EP32 + padding:
 #   real_rows = actual totalNumPaddedTokens on this rank (read from device)
 #   padded_rows = maxPermutedPaddedCount (workspace allocation, used for grid sizing)
@@ -38,14 +38,14 @@ CUDA_GRAPH_ITERS = 200
 # (real_rows, padded_rows, inner_dim)
 PRODUCTION_SCENARIOS = [
     # Low load: 16-32 concurrent requests
-    (96, 3072, 2048),
-    (192, 3072, 2048),
+    (96, 3072, 36864),
+    (192, 3072, 36864),
     # Medium load
-    (384, 3072, 2048),
-    (512, 8192, 2048),
+    (384, 3072, 36864),
+    (512, 8192, 36864),
     # High load
-    (768, 8192, 2048),
-    (1024, 32768, 2048),
+    (768, 8192, 36864),
+    (1024, 32768, 36864),
 ]
 
 
