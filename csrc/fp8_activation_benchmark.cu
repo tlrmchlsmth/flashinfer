@@ -51,6 +51,7 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// V2/V3/V4/V5 params (padded layout, no indirection)
 struct ActivationDeepSeekParams {
   cutlass::float_e4m3_t const* inPtr;
   cutlass::float_e4m3_t* outPtr;
@@ -60,8 +61,95 @@ struct ActivationDeepSeekParams {
   int32_t const* totalNumPaddedTokens;
 };
 
+// V1 params (production kernel with expandedIdx indirection)
+struct ActivationDeepSeekParamsV1 {
+  cutlass::float_e4m3_t const* inPtr;
+  cutlass::float_e4m3_t* outPtr;
+  float* inDqSfsPtr;
+  float* outDqSfsPtr;
+  int32_t innerDim;
+  int32_t numTokens;
+  int32_t topK;
+  int32_t* expandedIdxToPermutedIdx;
+  int32_t const* totalNumPaddedTokens;
+};
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// V2: Original kernel with hoisted loop invariants
+// V1: Production kernel (activationDeepSeekKernel) — uses expandedIdx indirection,
+//     loops over numTokens * topK, no padding awareness.
+//     Copy from csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu:202
+//     Instantiated with NumTokensPerCta=1.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+__global__ void __launch_bounds__(V2_THREADS_PER_CTA)
+    activationDeepSeekKernelV1(ActivationDeepSeekParamsV1 params) {
+  using BlockReduce = cub::BlockReduce<float, V2_THREADS_PER_CTA>;
+
+  __shared__ float s_scaleOut;
+  __shared__ typename BlockReduce::TempStorage tempStorage;
+
+  float constexpr E4m3MaxVal{448.f};
+  int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
+
+  using fp8_t = cutlass::float_e4m3_t;
+
+  for (int k = blockIdx.z; k < params.topK; k += gridDim.z) {
+    for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens;
+         tokenIdx += gridDim.y) {
+      for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x;
+           hiddenIdx < params.innerDim / 2;
+           hiddenIdx += blockDim.x * gridDim.x) {
+        int const expandedIdx = tokenIdx * params.topK + k;
+        int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+        if (permutedIdx == -1) continue;
+
+        int64_t const baseIdx =
+            (int64_t)permutedIdx * params.innerDim + hiddenIdx;
+        int64_t const scale1Idx =
+            (int64_t)permutedIdx +
+            (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
+        int64_t const scale2Idx =
+            (int64_t)permutedIdx +
+            (int64_t)totalNumPaddedTokens *
+                ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
+
+        float scale1 = params.inDqSfsPtr[scale1Idx];
+        float scale2 = params.inDqSfsPtr[scale2Idx];
+        float x1 = scale1 * static_cast<float>(params.inPtr[baseIdx]);
+        float x2 = scale2 * static_cast<float>(
+                                 params.inPtr[baseIdx + params.innerDim / 2]);
+
+        float out = silu_f(x2) * x1;
+        float absOut = fabsf(out);
+
+#if CUDA_VERSION >= 12090
+        float aMax =
+            BlockReduce(tempStorage).Reduce(absOut, cuda::maximum<>{});
+#else
+        float aMax = BlockReduce(tempStorage).Reduce(absOut, cub::Max{});
+#endif
+
+        if (threadIdx.x == 0) {
+          float scaleOut =
+              fmaxf(aMax / E4m3MaxVal, FLT_MIN);
+          s_scaleOut = scaleOut;
+          int64_t const scaleOutIdx =
+              (int64_t)permutedIdx +
+              (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
+          params.outDqSfsPtr[scaleOutIdx] = scaleOut;
+        }
+        __syncthreads();
+
+        int64_t const outIdx =
+            (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
+        params.outPtr[outIdx] = static_cast<fp8_t>(out / s_scaleOut);
+      }
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// V2: Original kernel with hoisted loop invariants (padded layout)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 __global__ void __launch_bounds__(V2_THREADS_PER_CTA)
@@ -223,6 +311,31 @@ __global__ void __launch_bounds__(WarpsPerCta * 32)
 // Launchers
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+static void launchActivationV1(
+    ActivationDeepSeekParamsV1& params, cudaStream_t stream) {
+  int const numScaleBlocks =
+      (params.innerDim / 2 + ELTS_PER_SCALE_BLOCK - 1) / ELTS_PER_SCALE_BLOCK;
+
+  int device{-1};
+  cudaGetDevice(&device);
+  int numSms = 0;
+  cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device);
+
+  // Production grid heuristic from run()
+  auto numCtas = numScaleBlocks * params.numTokens * params.topK;
+  int numTokensPerCta = 1;
+  if (numCtas > numSms * 32) {
+    numTokensPerCta = 4;
+  } else if (numCtas > numSms * 4) {
+    numTokensPerCta = 2;
+  }
+  int const gridSizeY = min(8192,
+      (params.numTokens + numTokensPerCta - 1) / numTokensPerCta);
+
+  dim3 grid(numScaleBlocks, gridSizeY, params.topK);
+  activationDeepSeekKernelV1<<<grid, V2_THREADS_PER_CTA, 0, stream>>>(params);
+}
+
 static void launchActivationV2(
     ActivationDeepSeekParams& params, int32_t maxPermutedPaddedCount,
     int32_t gridY_override, cudaStream_t stream) {
@@ -295,6 +408,36 @@ static ActivationDeepSeekParams makeParams(
   p.totalNumPaddedTokens =
       static_cast<int32_t const*>(total_padded_tokens.data_ptr());
   return p;
+}
+
+// V1: production kernel with expandedIdx indirection
+// extra args: expanded_idx_to_permuted_idx (int32 [numTokens * topK]),
+//             num_tokens (int64), top_k (int64)
+void activation_deepseek_fp8_v1(Tensor input, Tensor input_scales,
+                                Tensor output, Tensor output_scales,
+                                Tensor total_padded_tokens,
+                                Tensor expanded_idx_to_permuted_idx,
+                                int64_t inner_dim,
+                                int64_t num_tokens,
+                                int64_t top_k) {
+  checkInputs(input, input_scales, output, output_scales, total_padded_tokens);
+  CHECK_CUDA(expanded_idx_to_permuted_idx);
+  CHECK_CONTIGUOUS(expanded_idx_to_permuted_idx);
+  CHECK_INPUT_TYPE(expanded_idx_to_permuted_idx, dl_int32);
+
+  ActivationDeepSeekParamsV1 p;
+  p.inPtr = static_cast<cutlass::float_e4m3_t const*>(input.data_ptr());
+  p.outPtr = static_cast<cutlass::float_e4m3_t*>(output.data_ptr());
+  p.inDqSfsPtr = static_cast<float*>(input_scales.data_ptr());
+  p.outDqSfsPtr = static_cast<float*>(output_scales.data_ptr());
+  p.innerDim = static_cast<int32_t>(inner_dim);
+  p.numTokens = static_cast<int32_t>(num_tokens);
+  p.topK = static_cast<int32_t>(top_k);
+  p.expandedIdxToPermutedIdx =
+      static_cast<int32_t*>(expanded_idx_to_permuted_idx.data_ptr());
+  p.totalNumPaddedTokens =
+      static_cast<int32_t const*>(total_padded_tokens.data_ptr());
+  launchActivationV1(p, get_stream(input.device()));
 }
 
 // V2 baseline
@@ -397,6 +540,8 @@ void activation_deepseek_fp8_v5_tuned(Tensor input, Tensor input_scales,
                                get_stream(input.device()));
 }
 
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v1,
+                              activation_deepseek_fp8_v1);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v2,
                               activation_deepseek_fp8_v2);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v2_tuned,

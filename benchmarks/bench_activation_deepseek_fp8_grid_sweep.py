@@ -123,12 +123,16 @@ def create_test_inputs(padded_rows, real_rows, inner_dim, device="cuda"):
     # Device tensor for totalNumPaddedTokens
     total_padded = torch.tensor([real_rows], dtype=torch.int32, device=device)
 
+    # Identity mapping for V1 kernel (expandedIdx i -> permutedIdx i, topK=1)
+    expanded_idx = torch.arange(real_rows, dtype=torch.int32, device=device)
+
     return {
         "input": x_fp8,
         "input_scales": input_scales_flat,
         "output": output,
         "output_scales": output_scales,
         "total_padded": total_padded,
+        "expanded_idx": expanded_idx,
         "inner_dim": inner_dim,
         "real_rows": real_rows,
         "padded_rows": padded_rows,
@@ -140,7 +144,19 @@ def create_test_inputs(padded_rows, real_rows, inner_dim, device="cuda"):
 
 def run_kernel(module, inputs, grid_y=-1, version="v2"):
     fn_base = f"activation_deepseek_fp8_{version}"
-    if grid_y > 0:
+    if version == "v1":
+        module.activation_deepseek_fp8_v1(
+            inputs["input"],
+            inputs["input_scales"],
+            inputs["output"],
+            inputs["output_scales"],
+            inputs["total_padded"],
+            inputs["expanded_idx"],
+            inputs["inner_dim"],
+            inputs["real_rows"],  # num_tokens
+            1,  # topK=1 (identity mapping)
+        )
+    elif grid_y > 0:
         getattr(module, fn_base + "_tuned")(
             inputs["input"],
             inputs["input_scales"],
@@ -299,13 +315,19 @@ def run_sweep(args):
         )
         print(f"{'='*78}")
 
-        # --- V2 baselines (for comparison with production kernel) ---
+        # --- V1 production baseline (no padding, expandedIdx indirection) ---
         inputs_real = create_test_inputs(real_rows, real_rows, inner_dim)
-        v2_real_ms, _ = time_it(
-            functools.partial(run_kernel, module, inputs_real, -1, "v2"),
+        v1_ms, _ = time_it(
+            functools.partial(run_kernel, module, inputs_real, -1, "v1"),
             args.dry_run_iters,
             args.repeat_iters,
         )
+        print(
+            f"  V1 prod     (rows={real_rows:>5}, topK=1, no padding): "
+            f"{v1_ms:.4f} ms"
+        )
+
+        # --- V2 padded baseline (activationDeepSeekKernelV2 with prod grid heuristic) ---
         inputs_padded = create_test_inputs(padded_rows, real_rows, inner_dim)
         padded_ms, _ = time_it(
             functools.partial(run_kernel, module, inputs_padded, -1, "v2"),
@@ -313,12 +335,8 @@ def run_sweep(args):
             args.repeat_iters,
         )
         print(
-            f"  V2 no-pad   (padded={real_rows:>5}, total={real_rows:>5}): "
-            f"{v2_real_ms:.4f} ms"
-        )
-        print(
             f"  V2 padded   (padded={padded_rows:>5}, total={real_rows:>5}): "
-            f"{padded_ms:.4f} ms  ({padded_ms / v2_real_ms:.2f}x vs V2 no-pad)"
+            f"{padded_ms:.4f} ms  ({padded_ms / v1_ms:.2f}x vs V1)"
         )
 
         # --- V4 no-pad baseline (apples-to-apples for pad overhead) ---
@@ -399,7 +417,7 @@ def run_sweep(args):
             "real_rows": real_rows,
             "padded_rows": padded_rows,
             "inner_dim": inner_dim,
-            "v2_nopad_ms": v2_real_ms,
+            "v1_prod_ms": v1_ms,
             "v2_padded_ms": padded_ms,
             "v4_nopad_ms": v4_real_ms,
         }
@@ -423,33 +441,32 @@ def run_sweep(args):
     print(f"{'='*78}")
     print(
         f"  {'real':>6} {'pad':>6} "
-        f"{'V2_np':>8} {'V2_pad':>8} {'V2pad%':>7} "
-        f"{'V4_np':>8} {'V4_best':>8} {'V4pad%':>7} "
-        f"{'V4/V2':>7}"
+        f"{'V1_prod':>8} {'V2_pad':>8} "
+        f"{'V4_np':>8} {'V4_best':>8} {'pad%':>6} "
+        f"{'vs_V1':>7}"
     )
     print(
         f"  {'-'*6} {'-'*6} "
-        f"{'-'*8} {'-'*8} {'-'*7} "
-        f"{'-'*8} {'-'*8} {'-'*7} "
+        f"{'-'*8} {'-'*8} "
+        f"{'-'*8} {'-'*8} {'-'*6} "
         f"{'-'*7}"
     )
     for r in all_results:
-        v2_pad_pct = (r["v2_padded_ms"] / r["v2_nopad_ms"] - 1) * 100 if r["v2_nopad_ms"] > 0 else 0
         v4_best = min(r.get("v4_best_ms", float("inf")), r.get("v5_best_ms", float("inf")))
         v4_pad_pct = (v4_best / r["v4_nopad_ms"] - 1) * 100 if r["v4_nopad_ms"] > 0 else 0
-        v4_vs_v2 = r["v2_padded_ms"] / v4_best if v4_best > 0 else 0
+        vs_v1 = r["v1_prod_ms"] / v4_best if v4_best > 0 else 0
         print(
             f"  {r['real_rows']:>6} {r['padded_rows']:>6} "
-            f"{r['v2_nopad_ms']:>8.4f} {r['v2_padded_ms']:>8.4f} {v2_pad_pct:>6.0f}% "
-            f"{r['v4_nopad_ms']:>8.4f} {v4_best:>8.4f} {v4_pad_pct:>6.0f}% "
-            f"{v4_vs_v2:>6.1f}x"
+            f"{r['v1_prod_ms']:>8.4f} {r['v2_padded_ms']:>8.4f} "
+            f"{r['v4_nopad_ms']:>8.4f} {v4_best:>8.4f} {v4_pad_pct:>5.0f}% "
+            f"{vs_v1:>6.1f}x"
         )
 
     csv_file = os.path.join(args.output_dir, "summary.csv")
     with open(csv_file, "w", newline="") as f:
         fieldnames = [
             "real_rows", "padded_rows", "inner_dim",
-            "v2_nopad_ms", "v2_padded_ms", "v4_nopad_ms",
+            "v1_prod_ms", "v2_padded_ms", "v4_nopad_ms",
         ]
         for ver in ["v3", "v4", "v5"]:
             fieldnames += [f"{ver}_default_ms", f"{ver}_best_ms", f"{ver}_best_grid_y"]
