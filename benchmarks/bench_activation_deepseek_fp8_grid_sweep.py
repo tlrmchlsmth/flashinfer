@@ -299,42 +299,37 @@ def run_sweep(args):
         )
         print(f"{'='*78}")
 
-        # --- Baseline: no padding (padded = real) ---
+        # --- V2 baselines (for comparison with production kernel) ---
         inputs_real = create_test_inputs(real_rows, real_rows, inner_dim)
-        real_ms, real_std = time_it(
-            functools.partial(run_kernel, module, inputs_real),
+        v2_real_ms, _ = time_it(
+            functools.partial(run_kernel, module, inputs_real, -1, "v2"),
             args.dry_run_iters,
             args.repeat_iters,
         )
-        print(
-            f"  No padding  (padded={real_rows:>5}, total={real_rows:>5}): "
-            f"{real_ms:.4f} ms"
-        )
-
-        # --- Padded with real totalPadded (production case) ---
         inputs_padded = create_test_inputs(padded_rows, real_rows, inner_dim)
-        padded_ms, padded_std = time_it(
-            functools.partial(run_kernel, module, inputs_padded),
+        padded_ms, _ = time_it(
+            functools.partial(run_kernel, module, inputs_padded, -1, "v2"),
             args.dry_run_iters,
             args.repeat_iters,
         )
-        overhead = padded_ms / real_ms if real_ms > 0 else 0
         print(
-            f"  Padded+real  (padded={padded_rows:>5}, total={real_rows:>5}): "
-            f"{padded_ms:.4f} ms  ({overhead:.2f}x vs no-pad)"
+            f"  V2 no-pad   (padded={real_rows:>5}, total={real_rows:>5}): "
+            f"{v2_real_ms:.4f} ms"
+        )
+        print(
+            f"  V2 padded   (padded={padded_rows:>5}, total={real_rows:>5}): "
+            f"{padded_ms:.4f} ms  ({padded_ms / v2_real_ms:.2f}x vs V2 no-pad)"
         )
 
-        # --- Padded with full compute (totalPadded = padded_rows) ---
-        inputs_full = create_test_inputs(padded_rows, padded_rows, inner_dim)
-        full_ms, full_std = time_it(
-            functools.partial(run_kernel, module, inputs_full),
+        # --- V4 no-pad baseline (apples-to-apples for pad overhead) ---
+        v4_real_ms, _ = time_it(
+            functools.partial(run_kernel, module, inputs_real, -1, "v4"),
             args.dry_run_iters,
             args.repeat_iters,
         )
-        skip_speedup = full_ms / padded_ms if padded_ms > 0 else 0
         print(
-            f"  Full compute (padded={padded_rows:>5}, total={padded_rows:>5}): "
-            f"{full_ms:.4f} ms  (early-exit saves {skip_speedup:.2f}x)"
+            f"  V4 no-pad   (padded={real_rows:>5}, total={real_rows:>5}): "
+            f"{v4_real_ms:.4f} ms"
         )
 
         # --- Correctness checks ---
@@ -404,9 +399,9 @@ def run_sweep(args):
             "real_rows": real_rows,
             "padded_rows": padded_rows,
             "inner_dim": inner_dim,
-            "no_padding_ms": real_ms,
+            "v2_nopad_ms": v2_real_ms,
             "v2_padded_ms": padded_ms,
-            "full_compute_ms": full_ms,
+            "v4_nopad_ms": v4_real_ms,
         }
         for ver in ["v3", "v4", "v5"]:
             vr = version_results[ver]
@@ -427,32 +422,34 @@ def run_sweep(args):
     print("SUMMARY")
     print(f"{'='*78}")
     print(
-        f"  {'real':>6} {'pad':>6} {'no_pad':>8} {'V2_heur':>8} "
-        f"{'V4_best':>8} {'V5_best':>8} "
-        f"{'V5_gY':>6} {'V5/V2':>7} {'V5/np':>7}"
+        f"  {'real':>6} {'pad':>6} "
+        f"{'V2_np':>8} {'V2_pad':>8} {'V2pad%':>7} "
+        f"{'V4_np':>8} {'V4_best':>8} {'V4pad%':>7} "
+        f"{'V4/V2':>7}"
     )
     print(
-        f"  {'-'*6} {'-'*6} {'-'*8} {'-'*8} "
-        f"{'-'*8} {'-'*8} "
-        f"{'-'*6} {'-'*7} {'-'*7}"
+        f"  {'-'*6} {'-'*6} "
+        f"{'-'*8} {'-'*8} {'-'*7} "
+        f"{'-'*8} {'-'*8} {'-'*7} "
+        f"{'-'*7}"
     )
     for r in all_results:
-        best_ver = "v5" if r.get("v5_best_ms", float("inf")) <= r.get("v4_best_ms", float("inf")) else "v4"
-        best_ms = r[f"{best_ver}_best_ms"]
-        best_vs_v2 = r["v2_padded_ms"] / best_ms if best_ms > 0 else 0
-        best_vs_np = best_ms / r["no_padding_ms"] if r["no_padding_ms"] > 0 else 0
+        v2_pad_pct = (r["v2_padded_ms"] / r["v2_nopad_ms"] - 1) * 100 if r["v2_nopad_ms"] > 0 else 0
+        v4_best = min(r.get("v4_best_ms", float("inf")), r.get("v5_best_ms", float("inf")))
+        v4_pad_pct = (v4_best / r["v4_nopad_ms"] - 1) * 100 if r["v4_nopad_ms"] > 0 else 0
+        v4_vs_v2 = r["v2_padded_ms"] / v4_best if v4_best > 0 else 0
         print(
             f"  {r['real_rows']:>6} {r['padded_rows']:>6} "
-            f"{r['no_padding_ms']:>8.4f} {r['v2_padded_ms']:>8.4f} "
-            f"{r.get('v4_best_ms', 0):>8.4f} {r.get('v5_best_ms', 0):>8.4f} "
-            f"{r.get('v5_best_grid_y', 0):>6} "
-            f"{best_vs_v2:>6.1f}x {best_vs_np:>6.2f}x"
+            f"{r['v2_nopad_ms']:>8.4f} {r['v2_padded_ms']:>8.4f} {v2_pad_pct:>6.0f}% "
+            f"{r['v4_nopad_ms']:>8.4f} {v4_best:>8.4f} {v4_pad_pct:>6.0f}% "
+            f"{v4_vs_v2:>6.1f}x"
         )
 
     csv_file = os.path.join(args.output_dir, "summary.csv")
     with open(csv_file, "w", newline="") as f:
         fieldnames = [
-            "real_rows", "padded_rows", "inner_dim", "no_padding_ms", "v2_padded_ms",
+            "real_rows", "padded_rows", "inner_dim",
+            "v2_nopad_ms", "v2_padded_ms", "v4_nopad_ms",
         ]
         for ver in ["v3", "v4", "v5"]:
             fieldnames += [f"{ver}_default_ms", f"{ver}_best_ms", f"{ver}_best_grid_y"]
