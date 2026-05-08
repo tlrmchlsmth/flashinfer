@@ -364,7 +364,7 @@ def run_sweep(args):
                 args.repeat_iters,
             )
             vs_v2 = padded_ms / ms if ms > 0 else 0
-            vs_nopad = ms / real_ms if real_ms > 0 else 0
+            vs_nopad = ms / v4_real_ms if v4_real_ms > 0 else 0
             version_results[ver] = {"default_ms": ms}
             print(
                 f"  {ver.upper()} default    (padded={padded_rows:>5}, total={real_rows:>5}): "
@@ -392,7 +392,7 @@ def run_sweep(args):
                     args.repeat_iters,
                 )
                 vs_heur = padded_ms / ms if ms > 0 else 0
-                vs_nopad = ms / real_ms if real_ms > 0 else 0
+                vs_nopad = ms / v4_real_ms if v4_real_ms > 0 else 0
 
                 cfg_ok = check_correctness(module, inputs_padded, grid_y, ver)
                 sweep.append({"grid_y": grid_y, "median_ms": ms, "std_ms": std, "correct": cfg_ok})
@@ -402,7 +402,7 @@ def run_sweep(args):
                 ok_str = "Y" if cfg_ok else "FAIL"
                 print(f"  {grid_y:>8} {ms:>9.4f} {vs_heur:>7.3f}x {vs_nopad:>8.2f}x {ok_str:>4}")
 
-            best_vs_nopad = best_ver["median_ms"] / real_ms if real_ms > 0 else 0
+            best_vs_nopad = best_ver["median_ms"] / v4_real_ms if v4_real_ms > 0 else 0
             best_vs_heur = padded_ms / best_ver["median_ms"] if best_ver["median_ms"] > 0 else 0
             print(
                 f"\n  Best {ver.upper()}: gridY={best_ver['grid_y']} "
