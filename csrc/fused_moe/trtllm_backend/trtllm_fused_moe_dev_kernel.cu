@@ -397,6 +397,112 @@ activationDeepSeekKernelV2(KernelParams params) {
   }
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// V4: Vectorized kernel — 4 elts/thread, warp-level reduction, 4 warps/CTA.
+// Each warp independently handles one 128-element scale block.
+// No shared memory, no __syncthreads. Scale broadcast via __shfl.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+constexpr int V4_WARPS_PER_CTA = 4;
+constexpr int V4_THREADS_PER_CTA = V4_WARPS_PER_CTA * 32;
+constexpr int V4_ELTS_PER_THREAD = 4;
+constexpr int V4_ELTS_PER_SCALE_BLOCK = 128;
+
+__device__ __forceinline__ float warpReduceMax(float val) {
+  val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 16));
+  val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 8));
+  val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 4));
+  val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 2));
+  val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 1));
+  return val;
+}
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(V4_THREADS_PER_CTA)
+activationDeepSeekKernelV4(KernelParams params) {
+  using Type = typename KernelParams::Type;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  if constexpr (KernelParams::UsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
+  }
+#endif
+
+  float constexpr E4m3MaxVal{448.f};
+  int const totalPadded = params.totalNumPaddedTokens[0];
+  int const sfStride = totalPadded;
+  int const halfDim = params.innerDim / 2;
+  int const numOutputScaleBlocks = halfDim / V4_ELTS_PER_SCALE_BLOCK;
+
+  int const warpId = threadIdx.x / 32;
+  int const laneId = threadIdx.x % 32;
+  int const scaleBlock = blockIdx.x * V4_WARPS_PER_CTA + warpId;
+
+  if (scaleBlock >= numOutputScaleBlocks) return;
+
+  int const elemBase =
+      scaleBlock * V4_ELTS_PER_SCALE_BLOCK + laneId * V4_ELTS_PER_THREAD;
+
+  int64_t const scale1Base = (int64_t)sfStride * scaleBlock;
+  int64_t const scale2Base =
+      (int64_t)sfStride * (scaleBlock + numOutputScaleBlocks);
+
+  for (int permutedRow = blockIdx.y; permutedRow < totalPadded;
+       permutedRow += gridDim.y) {
+    float scale1, scale2;
+    if (laneId == 0) {
+      scale1 = params.inDqSfsPtr[permutedRow + scale1Base];
+      scale2 = params.inDqSfsPtr[permutedRow + scale2Base];
+    }
+    scale1 = __shfl_sync(0xffffffff, scale1, 0);
+    scale2 = __shfl_sync(0xffffffff, scale2, 0);
+
+    int64_t const x1Offset =
+        (int64_t)permutedRow * params.innerDim + elemBase;
+
+    uint32_t packed_x1 =
+        *reinterpret_cast<uint32_t const*>(&params.inPtr[x1Offset]);
+    uint32_t packed_x2 =
+        *reinterpret_cast<uint32_t const*>(&params.inPtr[x1Offset + halfDim]);
+
+    Type x1_vals[4], x2_vals[4];
+    memcpy(x1_vals, &packed_x1, 4);
+    memcpy(x2_vals, &packed_x2, 4);
+
+    float localMax = 0.0f;
+    float results[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float f1 = scale1 * static_cast<float>(x1_vals[i]);
+      float f2 = scale2 * static_cast<float>(x2_vals[i]);
+      results[i] = silu(f2) * f1;
+      localMax = fmaxf(localMax, fabsf(results[i]));
+    }
+
+    float aMax = warpReduceMax(localMax);
+
+    float scaleOut;
+    if (laneId == 0) {
+      scaleOut = fmaxf(aMax / E4m3MaxVal, std::numeric_limits<float>::min());
+      params.outDqSfsPtr[permutedRow + scale1Base] = scaleOut;
+    }
+    scaleOut = __shfl_sync(0xffffffff, scaleOut, 0);
+
+    float invScale = 1.0f / scaleOut;
+    Type out_vals[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      out_vals[i] = static_cast<Type>(results[i] * invScale);
+    }
+    uint32_t packed_out;
+    memcpy(&packed_out, out_vals, 4);
+
+    int64_t const outOffset = (int64_t)permutedRow * halfDim + elemBase;
+    *reinterpret_cast<uint32_t*>(&params.outPtr[outOffset]) = packed_out;
+  }
+}
+
 void run(Data const& data, void* stream) {
   if (data.mDtypeElt == tg::Dtype::E2m1) {
     // Note: this should be unreachable because the options are checked beforehand.
@@ -406,44 +512,20 @@ void run(Data const& data, void* stream) {
   }
 
   if (data.mUseDeepSeekFp8) {
-    constexpr int NUM_ELTS_PER_LOAD = 1;
-    constexpr int NUM_ELTS_PER_SF = 128;
-
     int device{-1};
     cudaGetDevice(&device);
     int numSms = 0;
     cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device);
 
-    // Output dimension is innerDim / 2, and each scale block is 128 elements
     int const outputDim = data.innerDim / 2;
-    int const numScaleBlocks = (outputDim + NUM_ELTS_PER_SF - 1) / NUM_ELTS_PER_SF;
-    int const gridSizeX = (numScaleBlocks + NUM_ELTS_PER_LOAD - 1) / NUM_ELTS_PER_LOAD;
-
-    auto numCtas = gridSizeX * data.numTokens * data.topK;
-    // FIXME: This is heruistic based on very short benchmark.
-    int numTokensPerCta = 1;
-    if (numCtas > numSms * 32) {
-      numTokensPerCta = 4;
-    } else if (numCtas > numSms * 4) {
-      numTokensPerCta = 2;
-    } else {
-      numTokensPerCta = 1;
-    }
-
-    int const gridSizeY = std::min(8192, (data.numTokens + numTokensPerCta - 1) / numTokensPerCta);
-
-    const dim3 grid(gridSizeX, gridSizeY, data.topK);
-
-    {
-      // Cap gridY to avoid launching excessive idle CTAs when maxPermutedPaddedCount
-      // is a worst-case upper bound much larger than the actual padded count (read on-device).
-      // The loop in activationDeepSeekKernelV2 handles gridY < totalPadded correctly.
-      int const maxConcurrentRows = numSms;
-      int const gridSizeYV2 = std::min(maxConcurrentRows, std::max(1, data.maxPermutedPaddedCount));
-      const dim3 gridV2(gridSizeX, gridSizeYV2, 1);
-      LAUNCH_ACTIVATION(data, activationDeepSeekKernelV2, 1, gridV2,
-                        DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
-    }
+    int const numScaleBlocks = (outputDim + V4_ELTS_PER_SCALE_BLOCK - 1) / V4_ELTS_PER_SCALE_BLOCK;
+    int const gridSizeX =
+        (numScaleBlocks + V4_WARPS_PER_CTA - 1) / V4_WARPS_PER_CTA;
+    int const gridSizeY =
+        std::min(numSms, std::max(1, data.maxPermutedPaddedCount));
+    const dim3 grid(gridSizeX, gridSizeY, 1);
+    LAUNCH_ACTIVATION(data, activationDeepSeekKernelV4, 1, grid,
+                      V4_THREADS_PER_CTA, 0, stream);
   } else {
     int const numThreads = 256;
     const dim3 grid(data.innerDim / 128, data.topK, std::min(8192, data.numTokens));
