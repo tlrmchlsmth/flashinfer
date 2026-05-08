@@ -654,25 +654,63 @@ cvt_fp16_to_fp4_expert(
     int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
     int64_t outOffset = rowIdx * colsPerRow + colIdx;
 
-    auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE,
-                                                     CVT_FP4_NUM_THREADS_PER_SF>(
-        rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
+    if constexpr (CVT_FP4_NUM_THREADS_PER_SF == 1) {
+      // Pack 4 SF bytes via warp shuffle for STG.32 instead of 4x STG.8.
+      uint8_t local_sf = 0;
 
-    if (use_silu_and_mul) {
-      PackedVecT gate_vec, up_vec;
-      loadPackedVec(gate_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
-      loadPackedVec(up_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset + colsPerRow);
-      reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
-          cvt_silu_mul_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE,
-                                   CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
-              gate_vec, up_vec, SFScaleVal, sf_out);
+      if (use_silu_and_mul) {
+        PackedVecT gate_vec, up_vec;
+        loadPackedVec(gate_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
+        loadPackedVec(up_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset + colsPerRow);
+        reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
+            cvt_silu_mul_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE,
+                                     CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
+                gate_vec, up_vec, SFScaleVal, &local_sf);
+      } else {
+        PackedVecT in_vec;
+        loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
+        reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
+            cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE,
+                                 CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
+                in_vec, SFScaleVal, &local_sf);
+      }
+
+      int innerK = colIdx & 3;
+      uint32_t packed_sf = static_cast<uint32_t>(local_sf) << (innerK * 8);
+      int lane = threadIdx.x & 31;
+      uint32_t group_mask = 0xFu << (lane & ~3);
+      packed_sf |= __shfl_xor_sync(group_mask, packed_sf, 1);
+      packed_sf |= __shfl_xor_sync(group_mask, packed_sf, 2);
+
+      if (innerK == 0) {
+        auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE,
+                                                         CVT_FP4_NUM_THREADS_PER_SF>(
+            rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
+        if (sf_out) {
+          *reinterpret_cast<uint32_t*>(sf_out) = packed_sf;
+        }
+      }
     } else {
-      PackedVecT in_vec;
-      loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
-      reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
-          cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE,
-                               CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
-              in_vec, SFScaleVal, sf_out);
+      auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE,
+                                                       CVT_FP4_NUM_THREADS_PER_SF>(
+          rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
+
+      if (use_silu_and_mul) {
+        PackedVecT gate_vec, up_vec;
+        loadPackedVec(gate_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
+        loadPackedVec(up_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset + colsPerRow);
+        reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
+            cvt_silu_mul_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE,
+                                     CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
+                gate_vec, up_vec, SFScaleVal, sf_out);
+      } else {
+        PackedVecT in_vec;
+        loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
+        reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
+            cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE,
+                                 CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
+                in_vec, SFScaleVal, sf_out);
+      }
     }
   }
 #endif
