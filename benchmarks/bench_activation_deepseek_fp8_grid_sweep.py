@@ -336,85 +336,68 @@ def run_sweep(args):
             f"{full_ms:.4f} ms  (early-exit saves {skip_speedup:.2f}x)"
         )
 
-        # --- Correctness check V2 ---
-        correct = check_correctness(module, inputs_padded, version="v2")
-        print(f"  V2 correctness (vs f32 reference): {'PASS' if correct else 'FAIL'}")
+        # --- Correctness checks ---
+        for ver in ["v2", "v3", "v4"]:
+            ok = check_correctness(module, inputs_padded, version=ver)
+            print(f"  {ver.upper()} correctness: {'PASS' if ok else 'FAIL'}")
 
-        # --- V3 optimized: default grid ---
-        v3_correct = check_correctness(module, inputs_padded, version="v3")
-        print(f"  V3 correctness (vs f32 reference): {'PASS' if v3_correct else 'FAIL'}")
-
-        v3_ms, v3_std = time_it(
-            functools.partial(run_kernel, module, inputs_padded, -1, "v3"),
-            args.dry_run_iters,
-            args.repeat_iters,
-        )
-        v3_vs_nopad = v3_ms / real_ms if real_ms > 0 else 0
-        v3_vs_v2 = padded_ms / v3_ms if v3_ms > 0 else 0
-        print(
-            f"  V3 default    (padded={padded_rows:>5}, total={real_rows:>5}): "
-            f"{v3_ms:.4f} ms  ({v3_vs_v2:.2f}x vs V2 heur, "
-            f"{v3_vs_nopad:.2f}x vs no-pad)"
-        )
-
-        # --- V3 grid Y sweep ---
-        print(f"\n  V3 Grid Y sweep (padded+real case):")
-        grid_y_candidates = get_grid_y_candidates(padded_rows, inner_dim, sm_count)
-        print(f"  {len(grid_y_candidates)} gridY values to test")
-        print(
-            f"  {'gridY':>8} {'v3_ms':>9} {'vs_v2h':>8} {'vs_nopad':>9} {'ok':>4}"
-        )
-        print(f"  {'-'*8} {'-'*9} {'-'*8} {'-'*9} {'-'*4}")
-
-        sweep_results = []
-        best = {"grid_y": -1, "median_ms": float("inf")}
-        n_fail = 0
-
-        for grid_y in grid_y_candidates:
+        # --- V3/V4 default grid comparison ---
+        version_results = {}
+        for ver in ["v3", "v4"]:
             ms, std = time_it(
-                functools.partial(run_kernel, module, inputs_padded, grid_y, "v3"),
+                functools.partial(run_kernel, module, inputs_padded, -1, ver),
                 args.dry_run_iters,
                 args.repeat_iters,
             )
-            vs_heur = padded_ms / ms if ms > 0 else 0
+            vs_v2 = padded_ms / ms if ms > 0 else 0
             vs_nopad = ms / real_ms if real_ms > 0 else 0
-
-            cfg_ok = check_correctness(module, inputs_padded, grid_y, "v3")
-            if not cfg_ok:
-                n_fail += 1
-
-            sweep_results.append(
-                {
-                    "grid_y": grid_y,
-                    "median_ms": ms,
-                    "std_ms": std,
-                    "correct": cfg_ok,
-                }
-            )
-
-            if ms < best["median_ms"]:
-                best = {"grid_y": grid_y, "median_ms": ms}
-
-            ok_str = "Y" if cfg_ok else "FAIL"
+            version_results[ver] = {"default_ms": ms}
             print(
-                f"  {grid_y:>8} {ms:>9.4f} {vs_heur:>7.3f}x "
-                f"{vs_nopad:>8.2f}x {ok_str:>4}"
+                f"  {ver.upper()} default    (padded={padded_rows:>5}, total={real_rows:>5}): "
+                f"{ms:.4f} ms  ({vs_v2:.2f}x vs V2 heur, "
+                f"{vs_nopad:.2f}x vs no-pad)"
             )
 
-        if n_fail > 0:
+        # --- Grid Y sweep for V3 and V4 ---
+        grid_y_candidates = get_grid_y_candidates(padded_rows, inner_dim, sm_count)
+
+        for ver in ["v3", "v4"]:
+            print(f"\n  {ver.upper()} Grid Y sweep ({len(grid_y_candidates)} values):")
             print(
-                f"\n  WARNING: {n_fail}/{len(grid_y_candidates)} configs "
-                f"produced incorrect output!"
+                f"  {'gridY':>8} {'ms':>9} {'vs_v2h':>8} {'vs_nopad':>9} {'ok':>4}"
             )
+            print(f"  {'-'*8} {'-'*9} {'-'*8} {'-'*9} {'-'*4}")
 
-        best_vs_nopad = best["median_ms"] / real_ms if real_ms > 0 else 0
-        best_vs_heur = padded_ms / best["median_ms"] if best["median_ms"] > 0 else 0
-        print(
-            f"\n  Best V3: gridY={best['grid_y']} "
-            f"{best['median_ms']:.4f}ms "
-            f"({best_vs_heur:.3f}x vs V2 heuristic, "
-            f"{best_vs_nopad:.2f}x vs no-pad)"
-        )
+            sweep = []
+            best_ver = {"grid_y": -1, "median_ms": float("inf")}
+
+            for grid_y in grid_y_candidates:
+                ms, std = time_it(
+                    functools.partial(run_kernel, module, inputs_padded, grid_y, ver),
+                    args.dry_run_iters,
+                    args.repeat_iters,
+                )
+                vs_heur = padded_ms / ms if ms > 0 else 0
+                vs_nopad = ms / real_ms if real_ms > 0 else 0
+
+                cfg_ok = check_correctness(module, inputs_padded, grid_y, ver)
+                sweep.append({"grid_y": grid_y, "median_ms": ms, "std_ms": std, "correct": cfg_ok})
+                if ms < best_ver["median_ms"]:
+                    best_ver = {"grid_y": grid_y, "median_ms": ms}
+
+                ok_str = "Y" if cfg_ok else "FAIL"
+                print(f"  {grid_y:>8} {ms:>9.4f} {vs_heur:>7.3f}x {vs_nopad:>8.2f}x {ok_str:>4}")
+
+            best_vs_nopad = best_ver["median_ms"] / real_ms if real_ms > 0 else 0
+            best_vs_heur = padded_ms / best_ver["median_ms"] if best_ver["median_ms"] > 0 else 0
+            print(
+                f"\n  Best {ver.upper()}: gridY={best_ver['grid_y']} "
+                f"{best_ver['median_ms']:.4f}ms "
+                f"({best_vs_heur:.3f}x vs V2 heur, {best_vs_nopad:.2f}x vs no-pad)"
+            )
+            version_results[ver]["best_grid_y"] = best_ver["grid_y"]
+            version_results[ver]["best_ms"] = best_ver["median_ms"]
+            version_results[ver]["sweep"] = sweep
 
         scenario_result = {
             "real_rows": real_rows,
@@ -423,15 +406,12 @@ def run_sweep(args):
             "no_padding_ms": real_ms,
             "v2_padded_ms": padded_ms,
             "full_compute_ms": full_ms,
-            "v3_default_ms": v3_ms,
-            "v3_best_grid_y": best["grid_y"],
-            "v3_best_ms": best["median_ms"],
-            "v3_best_vs_v2_heur": best_vs_heur,
-            "v3_best_vs_nopad": best_vs_nopad,
-            "v3_correct": v3_correct,
-            "sweep_failures": n_fail,
-            "sweep_results": sweep_results,
         }
+        for ver in ["v3", "v4"]:
+            vr = version_results[ver]
+            scenario_result[f"{ver}_default_ms"] = vr["default_ms"]
+            scenario_result[f"{ver}_best_grid_y"] = vr["best_grid_y"]
+            scenario_result[f"{ver}_best_ms"] = vr["best_ms"]
 
         out_file = os.path.join(
             args.output_dir,
@@ -443,43 +423,37 @@ def run_sweep(args):
 
     # Summary
     print(f"\n{'='*78}")
-    print("SUMMARY (V3 vectorized vs V2 baseline)")
+    print("SUMMARY (V3 8-warp vs V4 4-warp vs V2 baseline)")
     print(f"{'='*78}")
     print(
-        f"  {'real':>6} {'padded':>7} {'no_pad':>8} "
-        f"{'V2_heur':>9} {'V3_dflt':>9} {'V3_best':>9} "
-        f"{'best_gY':>8} {'vs_V2h':>8} {'vs_nopad':>9}"
+        f"  {'real':>6} {'pad':>6} {'no_pad':>8} {'V2_heur':>8} "
+        f"{'V3_best':>8} {'V3_gY':>6} "
+        f"{'V4_best':>8} {'V4_gY':>6} "
+        f"{'V4/V2':>7} {'V4/np':>7}"
     )
     print(
-        f"  {'-'*6} {'-'*7} {'-'*8} "
-        f"{'-'*9} {'-'*9} {'-'*9} "
-        f"{'-'*8} {'-'*8} {'-'*9}"
+        f"  {'-'*6} {'-'*6} {'-'*8} {'-'*8} "
+        f"{'-'*8} {'-'*6} "
+        f"{'-'*8} {'-'*6} "
+        f"{'-'*7} {'-'*7}"
     )
     for r in all_results:
-        vs_v2 = r["v2_padded_ms"] / r["v3_best_ms"] if r["v3_best_ms"] > 0 else 0
+        v4_vs_v2 = r["v2_padded_ms"] / r["v4_best_ms"] if r["v4_best_ms"] > 0 else 0
+        v4_vs_np = r["v4_best_ms"] / r["no_padding_ms"] if r["no_padding_ms"] > 0 else 0
         print(
-            f"  {r['real_rows']:>6} {r['padded_rows']:>7} "
-            f"{r['no_padding_ms']:>8.4f} "
-            f"{r['v2_padded_ms']:>9.4f} {r['v3_default_ms']:>9.4f} "
-            f"{r['v3_best_ms']:>9.4f} "
-            f"{r['v3_best_grid_y']:>8} "
-            f"{vs_v2:>7.1f}x "
-            f"{r['v3_best_vs_nopad']:>8.2f}x"
+            f"  {r['real_rows']:>6} {r['padded_rows']:>6} "
+            f"{r['no_padding_ms']:>8.4f} {r['v2_padded_ms']:>8.4f} "
+            f"{r['v3_best_ms']:>8.4f} {r['v3_best_grid_y']:>6} "
+            f"{r['v4_best_ms']:>8.4f} {r['v4_best_grid_y']:>6} "
+            f"{v4_vs_v2:>6.1f}x {v4_vs_np:>6.2f}x"
         )
 
     csv_file = os.path.join(args.output_dir, "summary.csv")
     with open(csv_file, "w", newline="") as f:
         fieldnames = [
-            "real_rows",
-            "padded_rows",
-            "inner_dim",
-            "no_padding_ms",
-            "v2_padded_ms",
-            "v3_default_ms",
-            "v3_best_ms",
-            "v3_best_grid_y",
-            "v3_best_vs_v2_heur",
-            "v3_best_vs_nopad",
+            "real_rows", "padded_rows", "inner_dim", "no_padding_ms", "v2_padded_ms",
+            "v3_default_ms", "v3_best_ms", "v3_best_grid_y",
+            "v4_default_ms", "v4_best_ms", "v4_best_grid_y",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()

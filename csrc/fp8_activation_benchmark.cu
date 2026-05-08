@@ -1,15 +1,15 @@
 /*
- * Benchmark wrapper for activationDeepSeekKernelV2 and optimized V3.
+ * Benchmark wrapper for activationDeepSeekKernelV2/V3/V4.
  *
- * V2: Original kernel (with hoisted loop invariants) — 128 threads, 1 elt/thread,
+ * V2: Original kernel (hoisted invariants) — 128 threads, 1 elt/thread,
  *     cub::BlockReduce, shared memory + __syncthreads.
  *
- * V3: Vectorized kernel — 4 elts/thread, warp-level reduction via __shfl,
- *     one warp per 128-element scale block, no shared memory, no barriers.
- *     Inspired by cvt_fp16_to_fp4_expert in quantization.cuh.
+ * V3: Vectorized — 4 elts/thread, warp-level reduction, 8 warps/CTA (256 threads).
+ *     One warp per scale block. No shared memory, no barriers.
  *
- * Data flow: FP8_E4M3 input + per-128-block scales -> f32 dequant -> silu(x2)*x1
- *            -> per-128-block max reduce -> FP8_E4M3 quantize + output scales
+ * V4: Occupancy-tuned V3 — 4 warps/CTA (128 threads) instead of 8.
+ *     2x more blocks → better SM utilization. Scale loads via lane-0 + shfl broadcast.
+ *     ncu showed V3 at 0.61 waves / 52% occupancy; V4 targets 1.0+ waves / 80%+.
  */
 
 #include <cub/cub.cuh>
@@ -27,10 +27,8 @@
 
 constexpr int V2_THREADS_PER_CTA = 128;
 constexpr int ELTS_PER_SCALE_BLOCK = 128;
-constexpr int V3_ELTS_PER_THREAD = 4;
-constexpr int V3_THREADS_PER_SCALE_BLOCK = ELTS_PER_SCALE_BLOCK / V3_ELTS_PER_THREAD;  // 32 = 1 warp
-constexpr int V3_WARPS_PER_CTA = 8;
-constexpr int V3_THREADS_PER_CTA = V3_WARPS_PER_CTA * 32;  // 256
+constexpr int ELTS_PER_THREAD = 4;
+constexpr int THREADS_PER_SCALE_BLOCK = ELTS_PER_SCALE_BLOCK / ELTS_PER_THREAD;  // 32 = 1 warp
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -46,8 +44,6 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// V2: Original kernel with hoisted loop invariants
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct ActivationDeepSeekParams {
   cutlass::float_e4m3_t const* inPtr;
@@ -57,6 +53,10 @@ struct ActivationDeepSeekParams {
   int32_t innerDim;
   int32_t const* totalNumPaddedTokens;
 };
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// V2: Original kernel with hoisted loop invariants
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 __global__ void __launch_bounds__(V2_THREADS_PER_CTA)
     activationDeepSeekKernelV2(ActivationDeepSeekParams params) {
@@ -112,21 +112,20 @@ __global__ void __launch_bounds__(V2_THREADS_PER_CTA)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// V3: Vectorized kernel — 4 elts/thread, warp-level reduction, no smem
+// Vectorized kernel template — parameterized by warps-per-CTA
 //
 // Thread mapping:
-//   warpId = threadIdx.x / 32   → selects scale block within CTA
-//   laneId = threadIdx.x % 32   → selects 4-element group within scale block
-//   scaleBlock = blockIdx.x * V3_WARPS_PER_CTA + warpId
+//   warpId = threadIdx.x / 32   -> selects scale block within CTA
+//   laneId = threadIdx.x % 32   -> selects 4-element group within scale block
+//   scaleBlock = blockIdx.x * WarpsPerCta + warpId
 //
-// Each warp independently handles one 128-element scale block:
-//   32 lanes × 4 elements = 128 elements
-//   Warp shuffle max reduction (no shared memory, no __syncthreads)
-//   Lane 0 broadcasts output scale via __shfl
+// Each warp independently handles one 128-element scale block.
+// Scale loads via lane-0 + __shfl broadcast (avoids uncoalesced sector waste).
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-__global__ void __launch_bounds__(V3_THREADS_PER_CTA)
-    activationDeepSeekKernelV3(ActivationDeepSeekParams params) {
+template <int WarpsPerCta>
+__global__ void __launch_bounds__(WarpsPerCta * 32)
+    activationDeepSeekKernelVec(ActivationDeepSeekParams params) {
   float constexpr E4m3MaxVal{448.f};
   int const totalPadded = params.totalNumPaddedTokens[0];
   int const sfStride = totalPadded;
@@ -135,40 +134,47 @@ __global__ void __launch_bounds__(V3_THREADS_PER_CTA)
 
   int const warpId = threadIdx.x / 32;
   int const laneId = threadIdx.x % 32;
-  int const scaleBlock = blockIdx.x * V3_WARPS_PER_CTA + warpId;
+  int const scaleBlock = blockIdx.x * WarpsPerCta + warpId;
 
   if (scaleBlock >= numOutputScaleBlocks) return;
 
-  int const elemBase = scaleBlock * ELTS_PER_SCALE_BLOCK + laneId * V3_ELTS_PER_THREAD;
+  int const elemBase =
+      scaleBlock * ELTS_PER_SCALE_BLOCK + laneId * ELTS_PER_THREAD;
 
-  // Loop-invariant scale bases (column-major: scales[scaleBlock * sfStride + row])
+  // Loop-invariant scale bases
   int64_t const scale1Base = (int64_t)sfStride * scaleBlock;
-  int64_t const scale2Base = (int64_t)sfStride * (scaleBlock + numOutputScaleBlocks);
+  int64_t const scale2Base =
+      (int64_t)sfStride * (scaleBlock + numOutputScaleBlocks);
 
   using fp8_t = cutlass::float_e4m3_t;
 
   for (int permutedRow = blockIdx.y; permutedRow < totalPadded;
        permutedRow += gridDim.y) {
-    // Load scales (broadcast within warp — all lanes read same address, L1 coalesces)
-    float scale1 = params.inDqSfsPtr[permutedRow + scale1Base];
-    float scale2 = params.inDqSfsPtr[permutedRow + scale2Base];
+    // Lane-0 loads scales, broadcast via shfl (avoids 32 redundant sector loads)
+    float scale1, scale2;
+    if (laneId == 0) {
+      scale1 = params.inDqSfsPtr[permutedRow + scale1Base];
+      scale2 = params.inDqSfsPtr[permutedRow + scale2Base];
+    }
+    scale1 = __shfl_sync(0xffffffff, scale1, 0);
+    scale2 = __shfl_sync(0xffffffff, scale2, 0);
 
     // Vectorized load: 4 fp8 elements as uint32
-    int64_t const x1Offset = (int64_t)permutedRow * params.innerDim + elemBase;
-    int64_t const x2Offset = x1Offset + halfDim;
+    int64_t const x1Offset =
+        (int64_t)permutedRow * params.innerDim + elemBase;
 
     uint32_t packed_x1 =
         *reinterpret_cast<uint32_t const*>(&params.inPtr[x1Offset]);
     uint32_t packed_x2 =
-        *reinterpret_cast<uint32_t const*>(&params.inPtr[x2Offset]);
+        *reinterpret_cast<uint32_t const*>(&params.inPtr[x1Offset + halfDim]);
 
     // Unpack, dequantize, silu+mul, track max
     fp8_t x1_vals[4], x2_vals[4];
     memcpy(x1_vals, &packed_x1, 4);
     memcpy(x2_vals, &packed_x2, 4);
 
-    float results[4];
     float localMax = 0.0f;
+    float results[4];
 #pragma unroll
     for (int i = 0; i < 4; i++) {
       float f1 = scale1 * static_cast<float>(x1_vals[i]);
@@ -177,16 +183,15 @@ __global__ void __launch_bounds__(V3_THREADS_PER_CTA)
       localMax = fmaxf(localMax, fabsf(results[i]));
     }
 
-    // Warp-level max reduction (32 lanes → 1 max, 5 shuffle steps)
+    // Warp-level max reduction
     float aMax = warp_reduce_max(localMax);
 
-    // Lane 0 computes output scale
+    // Lane 0 computes + stores output scale, broadcast to all lanes
     float scaleOut;
     if (laneId == 0) {
       scaleOut = fmaxf(aMax / E4m3MaxVal, FLT_MIN);
       params.outDqSfsPtr[permutedRow + scale1Base] = scaleOut;
     }
-    // Broadcast scale from lane 0 to all lanes
     scaleOut = __shfl_sync(0xffffffff, scaleOut, 0);
 
     // Quantize and vectorized store
@@ -199,8 +204,7 @@ __global__ void __launch_bounds__(V3_THREADS_PER_CTA)
     uint32_t packed_out;
     memcpy(&packed_out, out_vals, 4);
 
-    int64_t const outOffset =
-        (int64_t)permutedRow * halfDim + elemBase;
+    int64_t const outOffset = (int64_t)permutedRow * halfDim + elemBase;
     *reinterpret_cast<uint32_t*>(&params.outPtr[outOffset]) = packed_out;
   }
 }
@@ -210,39 +214,27 @@ __global__ void __launch_bounds__(V3_THREADS_PER_CTA)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static void launchActivationV2(
-    cutlass::float_e4m3_t const* inPtr, cutlass::float_e4m3_t* outPtr,
-    float* inDqSfsPtr, float* outDqSfsPtr, int32_t innerDim,
-    int32_t const* totalNumPaddedTokens, int32_t maxPermutedPaddedCount,
+    ActivationDeepSeekParams& params, int32_t maxPermutedPaddedCount,
     int32_t gridY_override, cudaStream_t stream) {
   int const numScaleBlocks =
-      (innerDim / 2 + ELTS_PER_SCALE_BLOCK - 1) / ELTS_PER_SCALE_BLOCK;
+      (params.innerDim / 2 + ELTS_PER_SCALE_BLOCK - 1) / ELTS_PER_SCALE_BLOCK;
 
   int gridSizeY = gridY_override > 0
                       ? gridY_override
                       : min(8192, max(1, maxPermutedPaddedCount));
 
   dim3 grid(numScaleBlocks, gridSizeY, 1);
-
-  ActivationDeepSeekParams params;
-  params.inPtr = inPtr;
-  params.outPtr = outPtr;
-  params.inDqSfsPtr = inDqSfsPtr;
-  params.outDqSfsPtr = outDqSfsPtr;
-  params.innerDim = innerDim;
-  params.totalNumPaddedTokens = totalNumPaddedTokens;
-
   activationDeepSeekKernelV2<<<grid, V2_THREADS_PER_CTA, 0, stream>>>(params);
 }
 
-static void launchActivationV3(
-    cutlass::float_e4m3_t const* inPtr, cutlass::float_e4m3_t* outPtr,
-    float* inDqSfsPtr, float* outDqSfsPtr, int32_t innerDim,
-    int32_t const* totalNumPaddedTokens, int32_t maxPermutedPaddedCount,
+template <int WarpsPerCta>
+static void launchActivationVec(
+    ActivationDeepSeekParams& params, int32_t maxPermutedPaddedCount,
     int32_t gridY_override, cudaStream_t stream) {
   int const numScaleBlocks =
-      (innerDim / 2 + ELTS_PER_SCALE_BLOCK - 1) / ELTS_PER_SCALE_BLOCK;
+      (params.innerDim / 2 + ELTS_PER_SCALE_BLOCK - 1) / ELTS_PER_SCALE_BLOCK;
   int const gridSizeX =
-      (numScaleBlocks + V3_WARPS_PER_CTA - 1) / V3_WARPS_PER_CTA;
+      (numScaleBlocks + WarpsPerCta - 1) / WarpsPerCta;
 
   int device{-1};
   cudaGetDevice(&device);
@@ -254,23 +246,14 @@ static void launchActivationV3(
                       : min(numSms, max(1, maxPermutedPaddedCount));
 
   dim3 grid(gridSizeX, gridSizeY, 1);
-
-  ActivationDeepSeekParams params;
-  params.inPtr = inPtr;
-  params.outPtr = outPtr;
-  params.inDqSfsPtr = inDqSfsPtr;
-  params.outDqSfsPtr = outDqSfsPtr;
-  params.innerDim = innerDim;
-  params.totalNumPaddedTokens = totalNumPaddedTokens;
-
-  activationDeepSeekKernelV3<<<grid, V3_THREADS_PER_CTA, 0, stream>>>(params);
+  activationDeepSeekKernelVec<WarpsPerCta>
+      <<<grid, WarpsPerCta * 32, 0, stream>>>(params);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // TVM-FFI wrappers
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Shared validation
 static void checkInputs(Tensor input, Tensor input_scales, Tensor output,
                          Tensor output_scales, Tensor total_padded_tokens) {
   CHECK_CUDA(input);
@@ -290,78 +273,93 @@ static void checkInputs(Tensor input, Tensor input_scales, Tensor output,
   CHECK_INPUT_TYPE(total_padded_tokens, dl_int32);
 }
 
+static ActivationDeepSeekParams makeParams(
+    Tensor input, Tensor input_scales, Tensor output,
+    Tensor output_scales, Tensor total_padded_tokens, int64_t inner_dim) {
+  ActivationDeepSeekParams p;
+  p.inPtr = static_cast<cutlass::float_e4m3_t const*>(input.data_ptr());
+  p.outPtr = static_cast<cutlass::float_e4m3_t*>(output.data_ptr());
+  p.inDqSfsPtr = static_cast<float*>(input_scales.data_ptr());
+  p.outDqSfsPtr = static_cast<float*>(output_scales.data_ptr());
+  p.innerDim = static_cast<int32_t>(inner_dim);
+  p.totalNumPaddedTokens =
+      static_cast<int32_t const*>(total_padded_tokens.data_ptr());
+  return p;
+}
+
 // V2 baseline
 void activation_deepseek_fp8_v2(Tensor input, Tensor input_scales,
                                 Tensor output, Tensor output_scales,
                                 Tensor total_padded_tokens,
                                 int64_t inner_dim) {
   checkInputs(input, input_scales, output, output_scales, total_padded_tokens);
-  launchActivationV2(
-      static_cast<cutlass::float_e4m3_t const*>(input.data_ptr()),
-      static_cast<cutlass::float_e4m3_t*>(output.data_ptr()),
-      static_cast<float*>(input_scales.data_ptr()),
-      static_cast<float*>(output_scales.data_ptr()),
-      static_cast<int32_t>(inner_dim),
-      static_cast<int32_t const*>(total_padded_tokens.data_ptr()),
-      static_cast<int32_t>(input.shape()[0]),
-      /*gridY_override=*/-1,
-      get_stream(input.device()));
+  auto params = makeParams(input, input_scales, output, output_scales,
+                            total_padded_tokens, inner_dim);
+  launchActivationV2(params, static_cast<int32_t>(input.shape()[0]),
+                     -1, get_stream(input.device()));
 }
 
-// V2 with grid override
 void activation_deepseek_fp8_v2_tuned(Tensor input, Tensor input_scales,
                                       Tensor output, Tensor output_scales,
                                       Tensor total_padded_tokens,
                                       int64_t inner_dim,
                                       int64_t grid_y_override) {
   checkInputs(input, input_scales, output, output_scales, total_padded_tokens);
-  launchActivationV2(
-      static_cast<cutlass::float_e4m3_t const*>(input.data_ptr()),
-      static_cast<cutlass::float_e4m3_t*>(output.data_ptr()),
-      static_cast<float*>(input_scales.data_ptr()),
-      static_cast<float*>(output_scales.data_ptr()),
-      static_cast<int32_t>(inner_dim),
-      static_cast<int32_t const*>(total_padded_tokens.data_ptr()),
-      static_cast<int32_t>(input.shape()[0]),
-      static_cast<int32_t>(grid_y_override),
-      get_stream(input.device()));
+  auto params = makeParams(input, input_scales, output, output_scales,
+                            total_padded_tokens, inner_dim);
+  launchActivationV2(params, static_cast<int32_t>(input.shape()[0]),
+                     static_cast<int32_t>(grid_y_override),
+                     get_stream(input.device()));
 }
 
-// V3 optimized (default grid)
+// V3: 8 warps/CTA (256 threads)
 void activation_deepseek_fp8_v3(Tensor input, Tensor input_scales,
                                 Tensor output, Tensor output_scales,
                                 Tensor total_padded_tokens,
                                 int64_t inner_dim) {
   checkInputs(input, input_scales, output, output_scales, total_padded_tokens);
-  launchActivationV3(
-      static_cast<cutlass::float_e4m3_t const*>(input.data_ptr()),
-      static_cast<cutlass::float_e4m3_t*>(output.data_ptr()),
-      static_cast<float*>(input_scales.data_ptr()),
-      static_cast<float*>(output_scales.data_ptr()),
-      static_cast<int32_t>(inner_dim),
-      static_cast<int32_t const*>(total_padded_tokens.data_ptr()),
-      static_cast<int32_t>(input.shape()[0]),
-      /*gridY_override=*/-1,
-      get_stream(input.device()));
+  auto params = makeParams(input, input_scales, output, output_scales,
+                            total_padded_tokens, inner_dim);
+  launchActivationVec<8>(params, static_cast<int32_t>(input.shape()[0]),
+                         -1, get_stream(input.device()));
 }
 
-// V3 with grid override
 void activation_deepseek_fp8_v3_tuned(Tensor input, Tensor input_scales,
                                       Tensor output, Tensor output_scales,
                                       Tensor total_padded_tokens,
                                       int64_t inner_dim,
                                       int64_t grid_y_override) {
   checkInputs(input, input_scales, output, output_scales, total_padded_tokens);
-  launchActivationV3(
-      static_cast<cutlass::float_e4m3_t const*>(input.data_ptr()),
-      static_cast<cutlass::float_e4m3_t*>(output.data_ptr()),
-      static_cast<float*>(input_scales.data_ptr()),
-      static_cast<float*>(output_scales.data_ptr()),
-      static_cast<int32_t>(inner_dim),
-      static_cast<int32_t const*>(total_padded_tokens.data_ptr()),
-      static_cast<int32_t>(input.shape()[0]),
-      static_cast<int32_t>(grid_y_override),
-      get_stream(input.device()));
+  auto params = makeParams(input, input_scales, output, output_scales,
+                            total_padded_tokens, inner_dim);
+  launchActivationVec<8>(params, static_cast<int32_t>(input.shape()[0]),
+                         static_cast<int32_t>(grid_y_override),
+                         get_stream(input.device()));
+}
+
+// V4: 4 warps/CTA (128 threads) — 2x more blocks for better occupancy
+void activation_deepseek_fp8_v4(Tensor input, Tensor input_scales,
+                                Tensor output, Tensor output_scales,
+                                Tensor total_padded_tokens,
+                                int64_t inner_dim) {
+  checkInputs(input, input_scales, output, output_scales, total_padded_tokens);
+  auto params = makeParams(input, input_scales, output, output_scales,
+                            total_padded_tokens, inner_dim);
+  launchActivationVec<4>(params, static_cast<int32_t>(input.shape()[0]),
+                         -1, get_stream(input.device()));
+}
+
+void activation_deepseek_fp8_v4_tuned(Tensor input, Tensor input_scales,
+                                      Tensor output, Tensor output_scales,
+                                      Tensor total_padded_tokens,
+                                      int64_t inner_dim,
+                                      int64_t grid_y_override) {
+  checkInputs(input, input_scales, output, output_scales, total_padded_tokens);
+  auto params = makeParams(input, input_scales, output, output_scales,
+                            total_padded_tokens, inner_dim);
+  launchActivationVec<4>(params, static_cast<int32_t>(input.shape()[0]),
+                         static_cast<int32_t>(grid_y_override),
+                         get_stream(input.device()));
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v2,
@@ -372,3 +370,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v3,
                               activation_deepseek_fp8_v3);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v3_tuned,
                               activation_deepseek_fp8_v3_tuned);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v4,
+                              activation_deepseek_fp8_v4);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(activation_deepseek_fp8_v4_tuned,
+                              activation_deepseek_fp8_v4_tuned);
