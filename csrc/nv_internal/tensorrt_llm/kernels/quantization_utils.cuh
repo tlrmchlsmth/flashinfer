@@ -790,6 +790,10 @@ __device__ __forceinline__ float silu(const float& val) { return val / (1.0f + _
 
 // Fused silu+mul+quantize: avoids intermediate bf16/f16 round-trip between
 // silu_and_mul and cvt_warp_fp16_to_fp4. Keeps values in f32 throughout.
+// Uses two-pass approach to avoid materializing a large fp2Vals array that
+// causes register spilling when gate_vec + up_vec + fp2Vals exceed the
+// register budget. Pass 1 finds the max without storing results; pass 2
+// recomputes silu*mul in small chunks for e2m1 conversion.
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF,
           bool TE_EXACT_NVFP4 = false>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>
@@ -802,9 +806,9 @@ cvt_silu_mul_fp16_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& gate_vec,
 
   using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
 
-  // Compute silu(gate) * up in f32, keeping results for quantization
-  float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
-
+  // Pass 1: compute silu(gate)*up one pair at a time and track the max.
+  // No intermediate array — only scalars are live across iterations.
+  float localMax = 0.0f;
 #pragma unroll
   for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
     float2 g, u;
@@ -815,16 +819,7 @@ cvt_silu_mul_fp16_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& gate_vec,
       g = __bfloat1622float2(gate_vec.elts[i]);
       u = __bfloat1622float2(up_vec.elts[i]);
     }
-    fp2Vals[i].x = silu(g.x) * u.x;
-    fp2Vals[i].y = silu(g.y) * u.y;
-  }
-
-  // Max reduction directly on f32 silu+mul results
-  float localMax = 0.0f;
-#pragma unroll
-  for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
-    localMax = fmaxf(localMax, fabsf(fp2Vals[i].x));
-    localMax = fmaxf(localMax, fabsf(fp2Vals[i].y));
+    localMax = fmaxf(localMax, fmaxf(fabsf(silu(g.x) * u.x), fabsf(silu(g.y) * u.y)));
   }
 
   constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
@@ -865,14 +860,33 @@ cvt_silu_mul_fp16_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& gate_vec,
     *SFout = fp8SFVal;
   }
 
-  // Scale and convert to e2m1 — values are already in f32
+  // Pass 2: recompute silu(gate)*up, apply scale, convert to e2m1.
+  // Process in chunks of 4 float2 to match fp32_vec_to_e2m1(float2(&)[4]).
+  constexpr int NUM_CHUNKS = CVT_ELTS_PER_THREAD / 8;
+  ReturnType e2m1Vec = 0;
 #pragma unroll
-  for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
-    fp2Vals[i].x *= outputScale;
-    fp2Vals[i].y *= outputScale;
+  for (int c = 0; c < NUM_CHUNKS; c++) {
+    float2 chunk[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float2 g, u;
+      if constexpr (std::is_same_v<Type, half>) {
+        g = __half22float2(gate_vec.elts[c * 4 + i]);
+        u = __half22float2(up_vec.elts[c * 4 + i]);
+      } else {
+        g = __bfloat1622float2(gate_vec.elts[c * 4 + i]);
+        u = __bfloat1622float2(up_vec.elts[c * 4 + i]);
+      }
+      chunk[i].x = silu(g.x) * u.x * outputScale;
+      chunk[i].y = silu(g.y) * u.y * outputScale;
+    }
+    uint32_t bits = fp32_vec_to_e2m1(chunk);
+    if constexpr (CVT_ELTS_PER_THREAD == 16) {
+      e2m1Vec |= static_cast<uint64_t>(bits) << (c * 32);
+    } else {
+      e2m1Vec = bits;
+    }
   }
-
-  ReturnType e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
   return e2m1Vec;
 #else
   return 0;

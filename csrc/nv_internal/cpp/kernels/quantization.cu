@@ -674,8 +674,8 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
       {  1024, 1024, 128},
       {  3072,  512, 128},
       {  8192,  768, 128},
-      { 16384, 1024, 128},
-      { 32768, 1024, 128},
+      { 16384, 1216, 128},
+      { 32768, 1216, 128},
   };
   static constexpr int kNumTuned = sizeof(kTuned) / sizeof(kTuned[0]);
 

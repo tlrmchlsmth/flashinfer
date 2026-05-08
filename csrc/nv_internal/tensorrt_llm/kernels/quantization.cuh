@@ -583,7 +583,7 @@ quantize_with_block_size_tma(
 template <class Type, bool UE8M0_SF = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-__launch_bounds__(512, 4) cvt_fp16_to_fp4_expert(
+__launch_bounds__(128, 8) cvt_fp16_to_fp4_expert(
 #else
 cvt_fp16_to_fp4_expert(
 #endif
