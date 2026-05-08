@@ -123,8 +123,23 @@ def create_test_inputs(padded_rows, real_rows, inner_dim, device="cuda"):
     # Device tensor for totalNumPaddedTokens
     total_padded = torch.tensor([real_rows], dtype=torch.int32, device=device)
 
-    # Identity mapping for V1 kernel (expandedIdx i -> permutedIdx i, topK=1)
-    expanded_idx = torch.arange(real_rows, dtype=torch.int32, device=device)
+    # V1 production mapping: topK=8, EP32 -> ~1/4 of expanded entries are real
+    # numTokens such that numTokens * (topK / num_experts_per_rank) ~ real_rows
+    # With 256 experts, EP32 -> 8 local experts, topK=8 -> ~8/256*8 = 0.25 real per token
+    # But simpler: numTokens * topK total entries, real_rows of them are real
+    v1_top_k = 8
+    # In production: numTokens = total tokens across all requests on this rank
+    # Each token routes to topK=8 experts out of 256, this rank handles 8 experts
+    # Expected real entries: numTokens * topK * (local_experts / total_experts)
+    #                      = numTokens * 8 * (8/256) = numTokens * 0.25
+    # So numTokens = real_rows / 0.25 = real_rows * 4
+    v1_num_tokens = real_rows * 4
+    v1_expanded = torch.full(
+        (v1_num_tokens * v1_top_k,), -1, dtype=torch.int32, device=device
+    )
+    # Scatter real_rows valid entries randomly across the expanded array
+    valid_positions = torch.randperm(v1_num_tokens * v1_top_k, device=device)[:real_rows]
+    v1_expanded[valid_positions] = torch.arange(real_rows, dtype=torch.int32, device=device)
 
     return {
         "input": x_fp8,
@@ -132,7 +147,9 @@ def create_test_inputs(padded_rows, real_rows, inner_dim, device="cuda"):
         "output": output,
         "output_scales": output_scales,
         "total_padded": total_padded,
-        "expanded_idx": expanded_idx,
+        "expanded_idx": v1_expanded,
+        "v1_num_tokens": v1_num_tokens,
+        "v1_top_k": v1_top_k,
         "inner_dim": inner_dim,
         "real_rows": real_rows,
         "padded_rows": padded_rows,
@@ -153,8 +170,8 @@ def run_kernel(module, inputs, grid_y=-1, version="v2"):
             inputs["total_padded"],
             inputs["expanded_idx"],
             inputs["inner_dim"],
-            inputs["real_rows"],  # num_tokens
-            1,  # topK=1 (identity mapping)
+            inputs["v1_num_tokens"],
+            inputs["v1_top_k"],
         )
     elif grid_y > 0:
         getattr(module, fn_base + "_tuned")(
