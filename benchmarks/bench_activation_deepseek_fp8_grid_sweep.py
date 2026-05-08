@@ -137,9 +137,10 @@ def create_test_inputs(padded_rows, real_rows, inner_dim, device="cuda"):
     }
 
 
-def run_kernel(module, inputs, grid_y=-1):
+def run_kernel(module, inputs, grid_y=-1, version="v2"):
+    fn_base = f"activation_deepseek_fp8_{version}"
     if grid_y > 0:
-        module.activation_deepseek_fp8_v2_tuned(
+        getattr(module, fn_base + "_tuned")(
             inputs["input"],
             inputs["input_scales"],
             inputs["output"],
@@ -149,7 +150,7 @@ def run_kernel(module, inputs, grid_y=-1):
             grid_y,
         )
     else:
-        module.activation_deepseek_fp8_v2(
+        getattr(module, fn_base)(
             inputs["input"],
             inputs["input_scales"],
             inputs["output"],
@@ -183,9 +184,9 @@ def compute_reference(inputs):
     return ref_out
 
 
-def check_correctness(module, inputs, grid_y=-1):
+def check_correctness(module, inputs, grid_y=-1, version="v2"):
     """Verify kernel output matches reference within FP8 quantization tolerance."""
-    run_kernel(module, inputs, grid_y)
+    run_kernel(module, inputs, grid_y, version)
     torch.cuda.synchronize()
 
     ref_f32 = compute_reference(inputs)
@@ -335,16 +336,33 @@ def run_sweep(args):
             f"{full_ms:.4f} ms  (early-exit saves {skip_speedup:.2f}x)"
         )
 
-        # --- Correctness check ---
-        correct = check_correctness(module, inputs_padded)
-        print(f"  Correctness (vs f32 reference): {'PASS' if correct else 'FAIL'}")
+        # --- Correctness check V2 ---
+        correct = check_correctness(module, inputs_padded, version="v2")
+        print(f"  V2 correctness (vs f32 reference): {'PASS' if correct else 'FAIL'}")
 
-        # --- Grid Y sweep ---
-        print(f"\n  Grid Y sweep (padded+real case):")
+        # --- V3 optimized: default grid ---
+        v3_correct = check_correctness(module, inputs_padded, version="v3")
+        print(f"  V3 correctness (vs f32 reference): {'PASS' if v3_correct else 'FAIL'}")
+
+        v3_ms, v3_std = time_it(
+            functools.partial(run_kernel, module, inputs_padded, -1, "v3"),
+            args.dry_run_iters,
+            args.repeat_iters,
+        )
+        v3_vs_nopad = v3_ms / real_ms if real_ms > 0 else 0
+        v3_vs_v2 = padded_ms / v3_ms if v3_ms > 0 else 0
+        print(
+            f"  V3 default    (padded={padded_rows:>5}, total={real_rows:>5}): "
+            f"{v3_ms:.4f} ms  ({v3_vs_v2:.2f}x vs V2 heur, "
+            f"{v3_vs_nopad:.2f}x vs no-pad)"
+        )
+
+        # --- V3 grid Y sweep ---
+        print(f"\n  V3 Grid Y sweep (padded+real case):")
         grid_y_candidates = get_grid_y_candidates(padded_rows, inner_dim, sm_count)
         print(f"  {len(grid_y_candidates)} gridY values to test")
         print(
-            f"  {'gridY':>8} {'ms':>9} {'vs_heur':>8} {'vs_nopad':>9} {'ok':>4}"
+            f"  {'gridY':>8} {'v3_ms':>9} {'vs_v2h':>8} {'vs_nopad':>9} {'ok':>4}"
         )
         print(f"  {'-'*8} {'-'*9} {'-'*8} {'-'*9} {'-'*4}")
 
@@ -354,14 +372,14 @@ def run_sweep(args):
 
         for grid_y in grid_y_candidates:
             ms, std = time_it(
-                functools.partial(run_kernel, module, inputs_padded, grid_y),
+                functools.partial(run_kernel, module, inputs_padded, grid_y, "v3"),
                 args.dry_run_iters,
                 args.repeat_iters,
             )
             vs_heur = padded_ms / ms if ms > 0 else 0
             vs_nopad = ms / real_ms if real_ms > 0 else 0
 
-            cfg_ok = check_correctness(module, inputs_padded, grid_y)
+            cfg_ok = check_correctness(module, inputs_padded, grid_y, "v3")
             if not cfg_ok:
                 n_fail += 1
 
@@ -392,9 +410,9 @@ def run_sweep(args):
         best_vs_nopad = best["median_ms"] / real_ms if real_ms > 0 else 0
         best_vs_heur = padded_ms / best["median_ms"] if best["median_ms"] > 0 else 0
         print(
-            f"\n  Best: gridY={best['grid_y']} "
+            f"\n  Best V3: gridY={best['grid_y']} "
             f"{best['median_ms']:.4f}ms "
-            f"({best_vs_heur:.3f}x vs heuristic, "
+            f"({best_vs_heur:.3f}x vs V2 heuristic, "
             f"{best_vs_nopad:.2f}x vs no-pad)"
         )
 
@@ -403,16 +421,15 @@ def run_sweep(args):
             "padded_rows": padded_rows,
             "inner_dim": inner_dim,
             "no_padding_ms": real_ms,
-            "padded_real_ms": padded_ms,
+            "v2_padded_ms": padded_ms,
             "full_compute_ms": full_ms,
-            "early_exit_speedup": skip_speedup,
-            "padding_overhead": overhead,
-            "correctness": correct,
+            "v3_default_ms": v3_ms,
+            "v3_best_grid_y": best["grid_y"],
+            "v3_best_ms": best["median_ms"],
+            "v3_best_vs_v2_heur": best_vs_heur,
+            "v3_best_vs_nopad": best_vs_nopad,
+            "v3_correct": v3_correct,
             "sweep_failures": n_fail,
-            "best_grid_y": best["grid_y"],
-            "best_ms": best["median_ms"],
-            "best_vs_heuristic": best_vs_heur,
-            "best_vs_nopad": best_vs_nopad,
             "sweep_results": sweep_results,
         }
 
@@ -426,25 +443,28 @@ def run_sweep(args):
 
     # Summary
     print(f"\n{'='*78}")
-    print("SUMMARY")
+    print("SUMMARY (V3 vectorized vs V2 baseline)")
     print(f"{'='*78}")
     print(
-        f"  {'real':>6} {'padded':>7} {'innerD':>6} {'no_pad':>8} "
-        f"{'pad+real':>9} {'full':>8} {'best_ms':>8} {'best_gY':>8} "
-        f"{'vs_nopad':>9}"
+        f"  {'real':>6} {'padded':>7} {'no_pad':>8} "
+        f"{'V2_heur':>9} {'V3_dflt':>9} {'V3_best':>9} "
+        f"{'best_gY':>8} {'vs_V2h':>8} {'vs_nopad':>9}"
     )
     print(
-        f"  {'-'*6} {'-'*7} {'-'*6} {'-'*8} {'-'*9} {'-'*8} "
+        f"  {'-'*6} {'-'*7} {'-'*8} "
+        f"{'-'*9} {'-'*9} {'-'*9} "
         f"{'-'*8} {'-'*8} {'-'*9}"
     )
     for r in all_results:
+        vs_v2 = r["v2_padded_ms"] / r["v3_best_ms"] if r["v3_best_ms"] > 0 else 0
         print(
             f"  {r['real_rows']:>6} {r['padded_rows']:>7} "
-            f"{r['inner_dim']:>6} "
-            f"{r['no_padding_ms']:>8.4f} {r['padded_real_ms']:>9.4f} "
-            f"{r['full_compute_ms']:>8.4f} {r['best_ms']:>8.4f} "
-            f"{r['best_grid_y']:>8} "
-            f"{r['best_vs_nopad']:>8.2f}x"
+            f"{r['no_padding_ms']:>8.4f} "
+            f"{r['v2_padded_ms']:>9.4f} {r['v3_default_ms']:>9.4f} "
+            f"{r['v3_best_ms']:>9.4f} "
+            f"{r['v3_best_grid_y']:>8} "
+            f"{vs_v2:>7.1f}x "
+            f"{r['v3_best_vs_nopad']:>8.2f}x"
         )
 
     csv_file = os.path.join(args.output_dir, "summary.csv")
@@ -454,13 +474,12 @@ def run_sweep(args):
             "padded_rows",
             "inner_dim",
             "no_padding_ms",
-            "padded_real_ms",
-            "full_compute_ms",
-            "early_exit_speedup",
-            "best_ms",
-            "best_grid_y",
-            "best_vs_heuristic",
-            "best_vs_nopad",
+            "v2_padded_ms",
+            "v3_default_ms",
+            "v3_best_ms",
+            "v3_best_grid_y",
+            "v3_best_vs_v2_heur",
+            "v3_best_vs_nopad",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
