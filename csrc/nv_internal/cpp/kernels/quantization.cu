@@ -657,33 +657,70 @@ void invokeBlockScaleInterleaveReverse(int b, int m, int n, uint8_t const* SFIn,
 template <typename T>
 void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* input,
                                        void* input_global_scale, void* mask, bool use_silu_and_mul,
-                                       int m_topk, int k, int n_experts, cudaStream_t stream) {
+                                       int m_topk, int k, int n_experts, cudaStream_t stream,
+                                       int grid_size_override, int block_size_override) {
   int device;
   TLLM_CUDA_CHECK(cudaGetDevice(&device));
   int multiProcessorCount;
   TLLM_CUDA_CHECK(
       cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device));
 
-  // Grid, Block size.
-  // Each thread converts 8 values.
   TLLM_CHECK_WITH_INFO(k > 0, "k must be > 0");
-  int const workSizePerRow = max(1, k / CVT_FP16_TO_FP4_ELTS_PER_THREAD);
-  int const totalWorkSize = m_topk * workSizePerRow;
-  dim3 block(std::min(workSizePerRow, 512));
-  // Get number of blocks per SM (assume we can fully utilize the SM).
-  int const numBlocksPerSM = 2048 / block.x;
-  dim3 grid(std::min(static_cast<int>((totalWorkSize + block.x - 1) / block.x),
-                     multiProcessorCount * numBlocksPerSM));
-  while (grid.x <= multiProcessorCount && block.x > 64) {
-    grid.x *= 2;
-    block.x = (block.x + 1) / 2;
-  }
-
-  // TODO(kaixih@nvidia): Should relax this to allow any grid size.
-  // shuw@nvidia.com: only deal with mask case
   TLLM_CHECK_WITH_INFO(mask != nullptr, "mask must be non-null for expert NVFP4 path");
   TLLM_CHECK_WITH_INFO(n_experts > 0, "n_experts must be > 0");
-  grid.x = (grid.x + n_experts - 1) / n_experts * n_experts;
+
+  // Tuned grid/block for masked expert quantization (EP32 DeepSeek-R1, GB200).
+  // The mask causes early-exit per expert, so oversized grids waste block
+  // scheduling overhead. Optimal grid tracks real token count, but we only
+  // know m_topk (padded) at launch. These values are swept on GB200 (152 SMs)
+  // across production shapes with realistic masks.
+  struct TunedPoint { int m_topk; int grid; int block; };
+  static constexpr TunedPoint kTuned[] = {
+      {    96,  256,  64},
+      {   192,  384,  64},
+      {   384,  512, 128},
+      {   768,  768, 128},
+      {  1024, 1024, 128},
+      {  3072,  512, 128},
+      {  8192,  768, 128},
+      { 16384, 1216, 128},
+      { 32768, 1216, 128},
+  };
+  static constexpr int kNumTuned = sizeof(kTuned) / sizeof(kTuned[0]);
+
+  int tuned_grid = kTuned[kNumTuned - 1].grid;
+  int tuned_block = kTuned[kNumTuned - 1].block;
+  for (int i = 0; i < kNumTuned; ++i) {
+    if (m_topk <= kTuned[i].m_topk) {
+      if (i == 0) {
+        tuned_grid = kTuned[0].grid;
+        tuned_block = kTuned[0].block;
+      } else {
+        float t = static_cast<float>(m_topk - kTuned[i-1].m_topk) /
+                  (kTuned[i].m_topk - kTuned[i-1].m_topk);
+        tuned_grid = kTuned[i-1].grid + static_cast<int>(t * (kTuned[i].grid - kTuned[i-1].grid));
+        tuned_block = kTuned[i].block;
+      }
+      break;
+    }
+  }
+  // Round grid up to multiple of n_experts
+  tuned_grid = (tuned_grid + n_experts - 1) / n_experts * n_experts;
+
+  dim3 grid(tuned_grid);
+  dim3 block(tuned_block);
+
+  if (grid_size_override > 0) {
+    TLLM_CHECK_WITH_INFO(grid_size_override % n_experts == 0,
+        "grid_size_override must be divisible by n_experts");
+    grid.x = grid_size_override;
+  }
+  if (block_size_override > 0) {
+    TLLM_CHECK_WITH_INFO(block_size_override <= 512,
+        "block_size_override must be <= 512 (launch_bounds)");
+    block.x = block_size_override;
+  }
+
   cvt_fp16_to_fp4_expert<T, false><<<grid, block, 0, stream>>>(
       m_topk, k, reinterpret_cast<T*>(input), reinterpret_cast<float*>(input_global_scale),
       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(output_scale),
@@ -711,7 +748,8 @@ template void invokeMxFP8Quantization<half>(int b, int m, int n, int padded_n, h
 template void invokeSiluAndMulNVFP4Quantization<half>(void* output, void* output_scale, void* input,
                                                       void* input_global_scale, void* mask,
                                                       bool use_silu_and_mul, int m_topk, int k,
-                                                      int n_experts, cudaStream_t stream);
+                                                      int n_experts, cudaStream_t stream,
+                                                      int grid_size_override, int block_size_override);
 
 #ifdef ENABLE_BF16
 template void invokeFP4Quantization<__nv_bfloat16, 16>(
@@ -729,7 +767,8 @@ template void invokeMxFP8Quantization<__nv_bfloat16>(int b, int m, int n, int pa
                                                      cudaStream_t stream);
 template void invokeSiluAndMulNVFP4Quantization<__nv_bfloat16>(
     void* output, void* output_scale, void* input, void* input_global_scale, void* mask,
-    bool use_silu_and_mul, int m_topk, int k, int n_experts, cudaStream_t stream);
+    bool use_silu_and_mul, int m_topk, int k, int n_experts, cudaStream_t stream,
+    int grid_size_override, int block_size_override);
 
 #endif
 

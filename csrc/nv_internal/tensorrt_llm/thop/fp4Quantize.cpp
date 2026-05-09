@@ -263,6 +263,72 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_sca
   }
 }
 
+void silu_and_mul_scaled_nvfp4_experts_quantize_tuned(Tensor output, Tensor output_scale,
+                                                      Tensor const input,
+                                                      Tensor const input_global_scale,
+                                                      Tensor const mask, bool use_silu_and_mul,
+                                                      int64_t grid_size_override,
+                                                      int64_t block_size_override) {
+  auto fp32_dtype = DLDataType{kDLFloat, 32, 1};
+  auto int32_dtype = DLDataType{kDLInt, 32, 1};
+  auto uint8_dtype = DLDataType{kDLUInt, 8, 1};
+  CHECK_CUDA(output);
+  CHECK_CUDA(output_scale);
+  CHECK_CUDA(input);
+  CHECK_CUDA(input_global_scale);
+  CHECK_CUDA(mask);
+  CHECK_CONTIGUOUS(output);
+  CHECK_CONTIGUOUS(output_scale);
+  CHECK_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(input_global_scale);
+  CHECK_CONTIGUOUS(mask);
+
+  TVM_FFI_ICHECK_EQ(mask.ndim(), 1);
+  TVM_FFI_ICHECK_EQ(output.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(output_scale.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(input.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(input_global_scale.ndim(), 1);
+
+  CHECK_INPUT_TYPE(input_global_scale, fp32_dtype);
+  CHECK_INPUT_TYPE(mask, int32_dtype);
+  CHECK_INPUT_TYPE(output, uint8_dtype);
+  CHECK_INPUT_TYPE(output_scale, int32_dtype);
+
+  constexpr int BLOCK_SIZE = 16;
+  auto m_topk = input.shape()[0];
+  auto k_by_2 = input.shape()[1];
+  auto k = k_by_2;
+  if (use_silu_and_mul) {
+    TVM_FFI_ICHECK_EQ(k_by_2 % 2, 0) << "k must be a multiple of 2";
+    k = k_by_2 / 2;
+  }
+  TVM_FFI_ICHECK_EQ(k % BLOCK_SIZE, 0) << "k must be a multiple of 16";
+  auto n_experts = input_global_scale.shape()[0];
+  TVM_FFI_ICHECK_EQ(mask.shape()[0], n_experts);
+  TVM_FFI_ICHECK_EQ(output.shape()[0], m_topk);
+  TVM_FFI_ICHECK_EQ(output.shape()[1], k / 2);
+  int scales_k = k / BLOCK_SIZE;
+  int padded_k = (scales_k + (4 - 1)) / 4 * 4;
+  TVM_FFI_ICHECK_EQ(output_scale.shape()[1] * 4, padded_k);
+
+  auto in_dtype = input.dtype();
+  const cudaStream_t stream = get_stream(input.device());
+  if (in_dtype == dl_float16) {
+    tensorrt_llm::kernels::invokeSiluAndMulNVFP4Quantization<half>(
+        output.data_ptr(), output_scale.data_ptr(), input.data_ptr(), input_global_scale.data_ptr(),
+        mask.data_ptr(), use_silu_and_mul, m_topk, k, n_experts, stream,
+        static_cast<int>(grid_size_override), static_cast<int>(block_size_override));
+  } else if (in_dtype == dl_bfloat16) {
+    tensorrt_llm::kernels::invokeSiluAndMulNVFP4Quantization<__nv_bfloat16>(
+        output.data_ptr(), output_scale.data_ptr(), input.data_ptr(), input_global_scale.data_ptr(),
+        mask.data_ptr(), use_silu_and_mul, m_topk, k, n_experts, stream,
+        static_cast<int>(grid_size_override), static_cast<int>(block_size_override));
+  } else {
+    TVM_FFI_LOG_AND_THROW(NotImplementedError) << "silu_and_mul_scaled_nvfp4_experts_quantize_tuned "
+                                                  "only supports input tensor with dtypes fp16/bf16.";
+  }
+}
+
 void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, TensorView output,
                                      TensorView output_scale, TensorView output_per_token_scale,
                                      Optional<TensorView> expanded_idx_to_permuted_idx,
@@ -352,4 +418,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_quantize, fp4_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_batched_quantize, fp4_batched_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(silu_and_mul_scaled_nvfp4_experts_quantize,
                               silu_and_mul_scaled_nvfp4_experts_quantize);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(silu_and_mul_scaled_nvfp4_experts_quantize_tuned,
+                              silu_and_mul_scaled_nvfp4_experts_quantize_tuned);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quant_and_per_token_scale, nvfp4_quant_and_per_token_scale);
