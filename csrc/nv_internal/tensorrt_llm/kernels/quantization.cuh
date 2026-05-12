@@ -583,7 +583,7 @@ quantize_with_block_size_tma(
 template <class Type, bool UE8M0_SF = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-__launch_bounds__(512, 4) cvt_fp16_to_fp4_expert(
+__launch_bounds__(128, 8) cvt_fp16_to_fp4_expert(
 #else
 cvt_fp16_to_fp4_expert(
 #endif
@@ -626,59 +626,54 @@ cvt_fp16_to_fp4_expert(
   int padded_m = (m + (128 - 1)) / 128 * 128;
 
   int colsPerRow = numCols / CVT_FP16_TO_FP4_ELTS_PER_THREAD;
-  // TODO(kaixih@nvidia): For now, we assume mask is used together with
-  // silu_and_mal. Maybe we want a more general behavior of mask later. In the
-  // silu case, the input last dim doubles.
+  // colsPerRow is always a power of 2 (numCols is multiple of SF_VEC_SIZE=16,
+  // ELTS_PER_THREAD is 8 or 16). Use bitshift instead of integer division.
+  int colsPerRow_shift = __ffs(colsPerRow) - 1;
+  int colsPerRow_mask = colsPerRow - 1;
   bool use_mask = mask != nullptr;
   int actualColsPerRow = use_silu_and_mul ? colsPerRow * 2 : colsPerRow;
 
-  // Each global thread processes one element
+  // Hoist loop-invariant computations
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[expert_idx];
+  constexpr int factor = CVT_FP4_SF_VEC_SIZE * 4;
+  int32_t numCols_padded = (numCols + factor - 1) / factor * factor;
+  int numCols_SFout = numCols_padded / CVT_FP4_SF_VEC_SIZE / 4;
+  uint32_t* SFout_in_expert = SFout + expert_idx * padded_m * numCols_SFout;
+  int mask_limit = use_mask ? mask[expert_idx] : m;
+
   for (int globalIdx = tid_in_expert + expert_idx * m * colsPerRow;
        globalIdx < (expert_idx + 1) * m * colsPerRow; globalIdx += actual_stride) {
-    // Calculate which row and column this global thread should process
-    int rowIdx = globalIdx / colsPerRow;
-    int colIdx = globalIdx % colsPerRow;
-
-    // Find index within the experts
+    int rowIdx = globalIdx >> colsPerRow_shift;
+    int colIdx = globalIdx & colsPerRow_mask;
     int rowIdx_in_expert = rowIdx - expert_idx * m;
 
-    // Early exit when using masks.
-    if (use_mask && rowIdx_in_expert >= mask[expert_idx]) {
+    if (rowIdx_in_expert >= mask_limit) {
       break;
     }
 
     int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
-    PackedVecT in_vec;
-    loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
-    if (use_silu_and_mul) {
-      PackedVecT in_vec_mul;
-      loadPackedVec(in_vec_mul, reinterpret_cast<PackedVecT const*>(in) + inOffset + colsPerRow);
-      silu_and_mul<Type, CVT_FP16_TO_FP4_ELTS_PER_THREAD>(in_vec, in_vec_mul);
-    }
-
-    // Get the output tensor offset.
-    // Same as inOffset because CVT_FP16_TO_FP4_ELTS_PER_THREAD elements are
-    // packed into one PackedFp4OutT (uint32_t for 8 elts, uint64_t for 16 elts).
     int64_t outOffset = rowIdx * colsPerRow + colIdx;
-
-    // Get the global scaling factor, which will be applied to the SF.
-    // Note SFScale is the same as next GEMM's alpha, which is
-    // (448.f / (Alpha_A / 6.f)).
-    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[expert_idx];
-
-    int factor = CVT_FP4_SF_VEC_SIZE * 4;
-    // The actual output_scales dim is computed from the padded numCols.
-    int32_t numCols_padded = (numCols + factor - 1) / factor * factor;
-    int numCols_SFout = numCols_padded / CVT_FP4_SF_VEC_SIZE / 4;
-    uint32_t* SFout_in_expert = SFout + expert_idx * padded_m * numCols_SFout;
 
     auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE,
                                                      CVT_FP4_NUM_THREADS_PER_SF>(
         rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
 
-    reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
-        cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
-            in_vec, SFScaleVal, sf_out);
+    if (use_silu_and_mul) {
+      PackedVecT gate_vec, up_vec;
+      loadPackedVec(gate_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
+      loadPackedVec(up_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset + colsPerRow);
+      reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
+          cvt_silu_mul_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE,
+                                   CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
+              gate_vec, up_vec, SFScaleVal, sf_out);
+    } else {
+      PackedVecT in_vec;
+      loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
+      reinterpret_cast<PackedFp4OutT*>(out)[outOffset] =
+          cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE,
+                               CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
+              in_vec, SFScaleVal, sf_out);
+    }
   }
 #endif
 }

@@ -840,6 +840,111 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx, i
 
 __device__ __forceinline__ float silu(const float& val) { return val / (1.0f + __expf(-val)); }
 
+// Fused silu+mul+quantize: avoids intermediate bf16/f16 round-trip between
+// silu_and_mul and cvt_warp_fp16_to_fp4. Keeps values in f32 throughout.
+// Uses two-pass approach to avoid materializing a large fp2Vals array that
+// causes register spilling when gate_vec + up_vec + fp2Vals exceed the
+// register budget. Pass 1 finds the max without storing results; pass 2
+// recomputes silu*mul in small chunks for e2m1 conversion.
+template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF,
+          bool TE_EXACT_NVFP4 = false>
+__device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>
+cvt_silu_mul_fp16_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& gate_vec,
+                         PackedVec<Type, CVT_ELTS_PER_THREAD> const& up_vec,
+                         float SFScaleVal, uint8_t* SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
+                "CVT_ELTS_PER_THREAD must be 8 or 16");
+
+  using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
+
+  // Pass 1: compute silu(gate)*up one pair at a time and track the max.
+  // No intermediate array — only scalars are live across iterations.
+  float localMax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
+    float2 g, u;
+    if constexpr (std::is_same_v<Type, half>) {
+      g = __half22float2(gate_vec.elts[i]);
+      u = __half22float2(up_vec.elts[i]);
+    } else {
+      g = __bfloat1622float2(gate_vec.elts[i]);
+      u = __bfloat1622float2(up_vec.elts[i]);
+    }
+    localMax = fmaxf(localMax, fmaxf(fabsf(silu(g.x) * u.x), fabsf(silu(g.y) * u.y)));
+  }
+
+  constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
+  if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
+    localMax = fmaxf(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+  }
+  if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
+    localMax = fmaxf(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+  }
+  float vecMax = localMax;
+
+  uint8_t fp8SFVal;
+  float outputScale;
+  if constexpr (UE8M0_SF) {
+    __nv_fp8_e8m0 tmp;
+    vecMax *= reciprocal_approximate_ftz(6.0f);
+    tmp.__x = __nv_cvt_float_to_e8m0(vecMax, __NV_SATFINITE, cudaRoundPosInf);
+    fp8SFVal = tmp.__x;
+    outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
+  } else if constexpr (TE_EXACT_NVFP4) {
+    constexpr float fp4_max_inv = 1.0f / 6.0f;
+    float SFValue = vecMax != 0.0f ? vecMax * (SFScaleVal * fp4_max_inv) : 0.0f;
+    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+    fp8SFVal = tmp.__x;
+    SFValue = static_cast<float>(tmp);
+    outputScale = vecMax != 0 ? __fdiv_rn(1.0f, SFValue * __fdiv_rn(1.0f, SFScaleVal)) : 0.0f;
+  } else {
+    auto SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+    fp8SFVal = tmp.__x;
+    SFValue = static_cast<float>(tmp);
+    outputScale = vecMax != 0
+                      ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
+                      : 0.0f;
+  }
+
+  if (SFout) {
+    *SFout = fp8SFVal;
+  }
+
+  // Pass 2: recompute silu(gate)*up, apply scale, convert to e2m1.
+  // Process in chunks of 4 float2 to match fp32_vec_to_e2m1(float2(&)[4]).
+  constexpr int NUM_CHUNKS = CVT_ELTS_PER_THREAD / 8;
+  ReturnType e2m1Vec = 0;
+#pragma unroll
+  for (int c = 0; c < NUM_CHUNKS; c++) {
+    float2 chunk[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float2 g, u;
+      if constexpr (std::is_same_v<Type, half>) {
+        g = __half22float2(gate_vec.elts[c * 4 + i]);
+        u = __half22float2(up_vec.elts[c * 4 + i]);
+      } else {
+        g = __bfloat1622float2(gate_vec.elts[c * 4 + i]);
+        u = __bfloat1622float2(up_vec.elts[c * 4 + i]);
+      }
+      chunk[i].x = silu(g.x) * u.x * outputScale;
+      chunk[i].y = silu(g.y) * u.y * outputScale;
+    }
+    uint32_t bits = fp32_vec_to_e2m1(chunk);
+    if constexpr (CVT_ELTS_PER_THREAD == 16) {
+      e2m1Vec |= static_cast<uint64_t>(bits) << (c * 32);
+    } else {
+      e2m1Vec = bits;
+    }
+  }
+  return e2m1Vec;
+#else
+  return 0;
+#endif
+}
+
 template <class Type, int CVT_ELTS_PER_THREAD>
 inline __device__ void silu_and_mul(PackedVec<Type, CVT_ELTS_PER_THREAD>& x_vec,
                                     const PackedVec<Type, CVT_ELTS_PER_THREAD>& y_vec) {
