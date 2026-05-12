@@ -178,6 +178,7 @@ struct Data {
   int32_t* expandedIdxToPermutedIdx;
 
   int32_t const* totalNumPaddedTokens;
+  int32_t maxPermutedPaddedCount{0};
 };
 
 template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
@@ -198,6 +199,7 @@ struct KernelParams {
   int32_t* expandedIdxToPermutedIdx;
 
   int32_t const* totalNumPaddedTokens;
+  int32_t maxPermutedPaddedCount;
 
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
@@ -213,6 +215,7 @@ struct KernelParams {
     params.numTokens = data.numTokens;
     params.topK = data.topK;
     params.totalNumPaddedTokens = data.totalNumPaddedTokens;
+    params.maxPermutedPaddedCount = data.maxPermutedPaddedCount;
 
     return params;
   }

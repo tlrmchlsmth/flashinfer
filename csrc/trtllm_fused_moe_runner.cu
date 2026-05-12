@@ -632,6 +632,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   activationData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
 
   activationData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
+  activationData.maxPermutedPaddedCount = workspace.total_max_padded_tokens;
 
   // Setup finalize data
   if (args.do_finalize) {
