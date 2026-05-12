@@ -54,6 +54,21 @@ namespace tg = batchedGemm::trtllm::gen;
 
 inline __device__ float silu(float x) { return x / (1.0f + expf(-x)); }
 
+__device__ __forceinline__ float warpReduceMax(float val) {
+  val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 16));
+  val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 8));
+  val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 4));
+  val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 2));
+  val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, 1));
+  return val;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+constexpr int DEEP_SEEK_ACTIVATION_WARPS_PER_CTA = 4;
+constexpr int DEEP_SEEK_ACTIVATION_ELTS_PER_THREAD = 4;
+constexpr int DEEP_SEEK_ACTIVATION_ELTS_PER_SCALE_BLOCK = 128;
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
@@ -197,140 +212,91 @@ struct KernelTraits<1> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-constexpr int DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA = 128;
+constexpr int DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA = DEEP_SEEK_ACTIVATION_WARPS_PER_CTA * 32;
 
+// Vectorized kernel: 4 elts/thread, warp-level reduction, no shared memory.
+// Each warp independently handles one 128-element scale block.
+// Scale broadcast via lane-0 __shfl (avoids 32 redundant sector loads).
+// Reads totalNumPaddedTokens[0] from device memory for dynamic stride,
+// enabling CUDA graph capture with varying token counts.
 template <typename KernelParams>
-__global__ void activationDeepSeekKernel(KernelParams params) {
+__global__ void __launch_bounds__(DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA)
+    activationDeepSeekKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
-  int32_t constexpr NumTokensPerCta = KernelParams::NumTokensPerCta;
-  using KernelTraits = KernelTraits<NumTokensPerCta>;
-  using MaxOp = typename KernelTraits::MaxOp;
-  using PackedType = typename KernelTraits::PackedType;
-  using BlockReduce = cub::BlockReduce<PackedType, DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA>;
-
-  __shared__ float s_scaleOutArr[NumTokensPerCta];
-  __shared__ typename BlockReduce::TempStorage tempStorage;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  // immediately trigger the secondary kernel when using PDL, then wait on primary
   if constexpr (KernelParams::UsePdl) {
     cudaTriggerProgrammaticLaunchCompletion();
     cudaGridDependencySynchronize();
   }
 #endif
 
-  // The largest (finite) value that can be represented using E4m3.
   float constexpr E4m3MaxVal{448.f};
+  int const totalPadded = params.totalNumPaddedTokens[0];
+  int const sfStride = totalPadded;
+  int const halfDim = params.innerDim / 2;
+  int const numOutputScaleBlocks = halfDim / DEEP_SEEK_ACTIVATION_ELTS_PER_SCALE_BLOCK;
 
-  int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
-  // Loop over tokens
-  float scale1Arr[NumTokensPerCta];
-  float scale2Arr[NumTokensPerCta];
-  float dataX1Arr[NumTokensPerCta];
-  float dataX2Arr[NumTokensPerCta];
-  float outArr[NumTokensPerCta];
-  float absOutArr[NumTokensPerCta];
-  int permutedIdxArr[NumTokensPerCta];
+  int const warpId = threadIdx.x / 32;
+  int const laneId = threadIdx.x % 32;
+  int const scaleBlock = blockIdx.x * DEEP_SEEK_ACTIVATION_WARPS_PER_CTA + warpId;
 
-  // Loop over tokens
-  for (int k = blockIdx.z; k < params.topK; k += gridDim.z) {
-    for (int tokenCtaIdx = blockIdx.y * NumTokensPerCta; tokenCtaIdx < params.numTokens;
-         tokenCtaIdx += gridDim.y * NumTokensPerCta) {
-      for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.innerDim / 2;
-           hiddenIdx += blockDim.x * gridDim.x) {
-#pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          scale1Arr[tokenInCtaIdx] = 0.0f;
-          scale2Arr[tokenInCtaIdx] = 0.0f;
-          dataX1Arr[tokenInCtaIdx] = 0.0f;
-          dataX2Arr[tokenInCtaIdx] = 0.0f;
-          outArr[tokenInCtaIdx] = 0.0f;
-          absOutArr[tokenInCtaIdx] = 0.0f;
-        }
-#pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          int const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
-          if (tokenIdx >= params.numTokens) {
-            break;
-          }
+  if (scaleBlock >= numOutputScaleBlocks) return;
 
-          int const expandedIdx = tokenIdx * params.topK + k;
-          int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
-          permutedIdxArr[tokenInCtaIdx] = permutedIdx;
-          if (permutedIdx == -1) {
-            continue;
-          }
+  int const elemBase = scaleBlock * DEEP_SEEK_ACTIVATION_ELTS_PER_SCALE_BLOCK +
+                       laneId * DEEP_SEEK_ACTIVATION_ELTS_PER_THREAD;
 
-          // Process blocks for this CTA
-          // Use int64_t to avoid overflow when permutedIdx * innerDim > INT32_MAX
-          int64_t const baseIdx = (int64_t)permutedIdx * params.innerDim + hiddenIdx;
+  int64_t const scale1Base = (int64_t)sfStride * scaleBlock;
+  int64_t const scale2Base = (int64_t)sfStride * (scaleBlock + numOutputScaleBlocks);
 
-          int64_t const scale1Idx =
-              (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
-          int64_t const scale2Idx =
-              (int64_t)permutedIdx +
-              (int64_t)totalNumPaddedTokens * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
-
-          scale1Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale1Idx];
-          scale2Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale2Idx];
-          dataX1Arr[tokenInCtaIdx] = static_cast<float>(params.inPtr[baseIdx]);
-          dataX2Arr[tokenInCtaIdx] =
-              static_cast<float>(params.inPtr[baseIdx + params.innerDim / 2]);
-        }
-
-#pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          float x1 = scale1Arr[tokenInCtaIdx] * dataX1Arr[tokenInCtaIdx];
-          float x2 = scale2Arr[tokenInCtaIdx] * dataX2Arr[tokenInCtaIdx];
-          float act = silu(x2);
-          float out = act * x1;
-          outArr[tokenInCtaIdx] = out;
-          absOutArr[tokenInCtaIdx] = fabsf(out);
-        }
-
-        auto absOutPacked = packedTypeFromArray<PackedType, NumTokensPerCta>(absOutArr);
-        auto aMaxPacked = BlockReduce(tempStorage).Reduce(absOutPacked, MaxOp{});
-        auto aMaxArr = arrayFromPackedType<PackedType, NumTokensPerCta>(aMaxPacked);
-
-#pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          if (threadIdx.x == 0) {
-            auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
-            if (tokenIdx >= params.numTokens) {
-              break;
-            }
-            int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
-            if (permutedIdx == -1) {
-              continue;
-            }
-            // Make sure the scale is strictly positive to avoid division by zero in case the
-            // maximum is zero.
-            float scaleOut =
-                fmaxf(aMaxArr[tokenInCtaIdx] / E4m3MaxVal, std::numeric_limits<float>::min());
-            s_scaleOutArr[tokenInCtaIdx] = scaleOut;
-            int64_t const scaleOut_idx = (int64_t)permutedIdxArr[tokenInCtaIdx] +
-                                         (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
-            params.outDqSfsPtr[scaleOut_idx] = scaleOut;
-          }
-        }
-        __syncthreads();
-
-#pragma unroll
-        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
-          auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
-          if (tokenIdx >= params.numTokens) {
-            break;
-          }
-          int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
-          if (permutedIdx == -1) {
-            continue;
-          }
-          float const scaleOut = s_scaleOutArr[tokenInCtaIdx];
-          int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
-          params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
-        }
-      }
+  for (int permutedRow = blockIdx.y; permutedRow < totalPadded; permutedRow += gridDim.y) {
+    float scale1, scale2;
+    if (laneId == 0) {
+      scale1 = params.inDqSfsPtr[permutedRow + scale1Base];
+      scale2 = params.inDqSfsPtr[permutedRow + scale2Base];
     }
+    scale1 = __shfl_sync(0xffffffff, scale1, 0);
+    scale2 = __shfl_sync(0xffffffff, scale2, 0);
+
+    int64_t const x1Offset = (int64_t)permutedRow * params.innerDim + elemBase;
+
+    uint32_t packed_x1 = *reinterpret_cast<uint32_t const*>(&params.inPtr[x1Offset]);
+    uint32_t packed_x2 = *reinterpret_cast<uint32_t const*>(&params.inPtr[x1Offset + halfDim]);
+
+    Type x1_vals[4], x2_vals[4];
+    memcpy(x1_vals, &packed_x1, 4);
+    memcpy(x2_vals, &packed_x2, 4);
+
+    float localMax = 0.0f;
+    float results[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float f1 = scale1 * static_cast<float>(x1_vals[i]);
+      float f2 = scale2 * static_cast<float>(x2_vals[i]);
+      results[i] = silu(f2) * f1;
+      localMax = fmaxf(localMax, fabsf(results[i]));
+    }
+
+    float aMax = warpReduceMax(localMax);
+
+    float scaleOut;
+    if (laneId == 0) {
+      scaleOut = fmaxf(aMax / E4m3MaxVal, std::numeric_limits<float>::min());
+      params.outDqSfsPtr[permutedRow + scale1Base] = scaleOut;
+    }
+    scaleOut = __shfl_sync(0xffffffff, scaleOut, 0);
+
+    float invScale = 1.0f / scaleOut;
+    Type out_vals[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      out_vals[i] = static_cast<Type>(results[i] * invScale);
+    }
+    uint32_t packed_out;
+    memcpy(&packed_out, out_vals, 4);
+
+    int64_t const outOffset = (int64_t)permutedRow * halfDim + elemBase;
+    *reinterpret_cast<uint32_t*>(&params.outPtr[outOffset]) = packed_out;
   }
 }
 
@@ -345,35 +311,21 @@ void run(Data const& data, void* stream) {
   }
 
   if (data.mUseDeepSeekFp8) {
-    constexpr int NUM_ELTS_PER_LOAD = 1;
-    constexpr int NUM_ELTS_PER_SF = 128;
-
     int device{-1};
     cudaGetDevice(&device);
     int numSms = 0;
     cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device);
 
-    // Output dimension is innerDim / 2, and each scale block is 128 elements
     int const outputDim = data.innerDim / 2;
-    int const numScaleBlocks = (outputDim + NUM_ELTS_PER_SF - 1) / NUM_ELTS_PER_SF;
-    int const gridSizeX = (numScaleBlocks + NUM_ELTS_PER_LOAD - 1) / NUM_ELTS_PER_LOAD;
+    int const numScaleBlocks = (outputDim + DEEP_SEEK_ACTIVATION_ELTS_PER_SCALE_BLOCK - 1) /
+                               DEEP_SEEK_ACTIVATION_ELTS_PER_SCALE_BLOCK;
+    int const gridSizeX = (numScaleBlocks + DEEP_SEEK_ACTIVATION_WARPS_PER_CTA - 1) /
+                          DEEP_SEEK_ACTIVATION_WARPS_PER_CTA;
+    int const gridSizeY = std::min(numSms, std::max(1, data.maxPermutedPaddedCount));
 
-    auto numCtas = gridSizeX * data.numTokens * data.topK;
-    // FIXME: This is heruistic based on very short benchmark.
-    int numTokensPerCta = 1;
-    if (numCtas > numSms * 32) {
-      numTokensPerCta = 4;
-    } else if (numCtas > numSms * 4) {
-      numTokensPerCta = 2;
-    } else {
-      numTokensPerCta = 1;
-    }
+    const dim3 grid(gridSizeX, gridSizeY, 1);
 
-    int const gridSizeY = std::min(8192, (data.numTokens + numTokensPerCta - 1) / numTokensPerCta);
-
-    const dim3 grid(gridSizeX, gridSizeY, data.topK);
-
-    LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid,
+    LAUNCH_ACTIVATION(data, activationDeepSeekKernel, 1, grid,
                       DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
   } else {
     int const numThreads = 256;
